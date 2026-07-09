@@ -641,7 +641,7 @@ def describe_exception(exc: BaseException, *, timeout: Optional[int] = None) -> 
 def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     site = SITE_BY_MARKETPLACE.get(config.get("MARKETPLACE", "US").upper(), "amz_us")
     marketplace = config.get("MARKETPLACE", "US").upper()
-    pangolin_timeout = config_int(config, "PANGOLIN_TIMEOUT_SECONDS", 8)
+    pangolin_timeout = config_int(config, "PANGOLIN_TIMEOUT_SECONDS", 20)
     mcp_timeout = config_int(config, "MCP_TIMEOUT_SECONDS", 20)
     xingshang_timeout = config_int(config, "XINGSHANG_TIMEOUT_SECONDS", mcp_timeout)
     xingshang_force_refresh = config_bool(config, "XINGSHANG_FORCE_REFRESH", False)
@@ -742,9 +742,7 @@ def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, 
             detail_asin = first_text(detail.get("asin")) if detail else None
             detail_matches_child = not detail_asin or (is_asin(detail_asin) and detail_asin.upper() == child_asin)
             detail_valid = front_detail_is_valid(detail, child_asin) if detail else False
-            if not detail and (child_asin in source_child_asins or pangolin_failed):
-                detail, child_source = fetch_fallback_detail(config, child_asin, marketplace, snapshot["errors"], "child")
-            elif detail and child_source == "pangolin" and detail_matches_child and (child_asin in source_child_asins or detail_valid) and child_needs_supplement(child_asin, detail):
+            if detail and child_source == "pangolin" and detail_matches_child and (child_asin in source_child_asins or detail_valid) and child_needs_supplement(child_asin, detail):
                 fallback_detail, fallback_source = fetch_fallback_detail(config, child_asin, marketplace, snapshot["errors"], "child")
                 if fallback_detail:
                     detail = merge_missing_detail(detail, fallback_detail)

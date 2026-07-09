@@ -307,7 +307,10 @@ class MonitorTest(unittest.TestCase):
             return {"asin": asin, "price": 1.0, "coupon": "", "fulfillment": "AMZ"}, "SELLERSPRITE_MCP_URL"
 
         with (
-            patch("monitor.pangolin_scrape", return_value={"data": {"json": {"data": {"results": []}}}}),
+            patch(
+                "monitor.pangolin_scrape",
+                side_effect=lambda token, parser_name, content, *, site, zipcode, timeout: {"data": {"json": {"data": {"results": [] if content in {"B0FFT1JQ9T", "B0FVX93K44", "B0FVX6PTYC"} else [{"asin": content, "price": "$1.00", "fulfillment": "AMZ"}]}}}},
+            ),
             patch("monitor.fetch_fallback_detail", side_effect=fake_fallback),
             patch("monitor.fetch_inventory", return_value={"items": [{"asin": asin, "inventory": index} for index, asin in enumerate(inventory_children, 1)]}),
         ):
@@ -457,6 +460,42 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(snapshot["children"]["B0FFT2PHP9"]["front_status"], "不可售/404")
         self.assertEqual(snapshot["children"]["B0FVX93K44"]["front_status"], "不可售/404")
 
+    def test_collect_snapshot_does_not_use_fallback_to_prove_front_validity_after_pangolin_timeout(self):
+        def fake_pangolin(token, parser_name, content, *, site, zipcode, timeout):
+            if content == "B0FFT1JQ9T":
+                return {"data": {"json": {"data": {"results": [{"asin": content, "variationList": [{"asin": "B0FFT2PHP9"}]}]}}}}
+            if content == "B0FFT2PHP9":
+                raise monitor.MonitorError("timeout")
+            return {"data": {"json": {"data": {"results": []}}}}
+
+        def fake_fallback(config, asin, marketplace, errors, label):
+            if label == "parent":
+                return {"asin": asin, "variationList": [{"asin": "B0FFT2PHP9"}]}, "SELLERSPRITE_MCP_URL"
+            return {"asin": asin, "price": 76.49, "fulfillment": "AMZ"}, "SELLERSPRITE_MCP_URL"
+
+        with (
+            patch("monitor.pangolin_scrape", side_effect=fake_pangolin),
+            patch("monitor.fetch_fallback_detail", side_effect=fake_fallback),
+            patch("monitor.fetch_inventory", return_value={"items": [{"asin": "B0FFT2PHP9", "inventory": 0}]}),
+        ):
+            snapshot = monitor.collect_snapshot(
+                {
+                    "PANGOLINFO_API_TOKEN": "token",
+                    "MONITOR_PARENT_ASINS": "B0FFT1JQ9T",
+                    "XINGSHANG_MCP_URL_TEMPLATE": "https://example.com/{parent_asin}",
+                    "MARKETPLACE": "US",
+                    "PANGOLIN_ZIPCODE": "10041",
+                    "PANGOLIN_TIMEOUT_SECONDS": "1",
+                    "MCP_TIMEOUT_SECONDS": "1",
+                    "SELLERSPRITE_MCP_URL": "https://mcp.sellersprite.com/mcp",
+                }
+            )
+
+        parent = snapshot["parents"]["B0FFT1JQ9T"]
+        self.assertEqual(parent["child_asins"], [])
+        self.assertEqual(parent["inventory_only_asins"], ["B0FFT2PHP9"])
+        self.assertEqual(snapshot["children"]["B0FFT2PHP9"]["front_status"], "不可售/404")
+
     def test_collect_snapshot_uses_previous_inventory_when_xingshang_times_out(self):
         previous = {
             "parents": {"B0FFT1JQ9T": {"child_asins": ["B0FFT34472", "B0FVX93K44"]}},
@@ -479,7 +518,10 @@ class MonitorTest(unittest.TestCase):
             return {"asin": asin, "price": 1.0, "coupon": "", "fulfillment": "AMZ"}, "SELLERSPRITE_MCP_URL"
 
         with (
-            patch("monitor.pangolin_scrape", return_value={"data": {"json": {"data": {"results": []}}}}),
+            patch(
+                "monitor.pangolin_scrape",
+                side_effect=lambda token, parser_name, content, *, site, zipcode, timeout: {"data": {"json": {"data": {"results": [{"asin": content, "price": "$1.00", "fulfillment": "AMZ"}] if content == "B0FFT34472" else []}}}},
+            ),
             patch("monitor.fetch_fallback_detail", side_effect=fake_fallback),
             patch("monitor.fetch_inventory", side_effect=TimeoutError()),
         ):
