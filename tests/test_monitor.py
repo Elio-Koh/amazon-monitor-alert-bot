@@ -293,6 +293,41 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(deal["promotion"], "Limited time deal")
         self.assertEqual(choice["promotion"], "")
 
+    def test_normalizes_pangolin_discount_types_savings_and_promotions(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {
+                "asin": "B0GJZYZHJJ",
+                "price": "$20.24",
+                "discountTypes": ["Limited time deal"],
+                "savingsPercentage": "23%",
+                "promotions": [{"quantity": 2, "discount": "10%"}],
+            },
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Limited time deal; 23% off; Buy 2 save 10%")
+
+    def test_normalizes_pangolin_in_stock_as_inventory_when_xingshang_missing(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "price": "$42.29", "inStock": "Only 16 left in stock - order soon."},
+            None,
+            "pangolin",
+        )
+        overridden = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "price": "$42.29", "inStock": "Only 16 left in stock - order soon."},
+            9,
+            "pangolin",
+        )
+
+        self.assertEqual(child["inventory"], 16)
+        self.assertEqual(child["inventory_source"], "front_detail")
+        self.assertEqual(overridden["inventory"], 9)
+        self.assertEqual(overridden["inventory_source"], "xingshang")
+
     def test_pangolin_error_response_is_not_treated_as_empty(self):
         with self.assertRaisesRegex(monitor.MonitorError, "账户已过期"):
             monitor.extract_results({"code": 2007, "message": "账户已过期", "data": None})

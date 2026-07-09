@@ -177,6 +177,16 @@ def parse_int(value: Any) -> Optional[int]:
     return int(match.group(1).replace(",", "")) if match else None
 
 
+def parse_inventory(value: Any) -> Optional[int]:
+    text = first_text(value)
+    if not text:
+        return None
+    lower = text.lower()
+    if "out of stock" in lower or "currently unavailable" in lower or "unavailable" in lower:
+        return 0
+    return parse_int(text)
+
+
 def config_int(config: Mapping[str, str], key: str, default: int) -> int:
     value = parse_int(config.get(key))
     return value if value is not None and value > 0 else default
@@ -294,20 +304,32 @@ def front_detail_is_valid(detail: Mapping[str, Any], requested_asin: Optional[st
 
 
 def normalize_promotion(detail: Mapping[str, Any]) -> Optional[str]:
-    text = first_text(
-        detail.get("promotion")
-        or detail.get("promotions")
-        or detail.get("deal")
-        or detail.get("dealBadge")
-        or detail.get("dealType")
-        or detail.get("discountTypes")
-    )
-    if not text:
-        return None
-    lower = text.lower()
-    if "amazon's choice" in lower or "amazon choice" in lower or "best seller" in lower:
-        return None
-    return text
+    parts: List[str] = []
+
+    def add(value: Any) -> None:
+        text = first_text(value)
+        if not text:
+            return
+        lower = text.lower()
+        if "amazon's choice" in lower or "amazon choice" in lower or "best seller" in lower:
+            return
+        if text not in parts:
+            parts.append(text)
+
+    for key in ("promotion", "deal", "dealBadge", "dealType", "discountTypes"):
+        for item in listify(detail.get(key)):
+            add(item)
+    savings = first_text(detail.get("savingsPercentage"))
+    if savings:
+        add(f"{savings} off")
+    for item in listify(detail.get("promotions")):
+        if isinstance(item, Mapping):
+            quantity = first_text(item.get("quantity"))
+            discount = first_text(item.get("discount"))
+            add(f"Buy {quantity} save {discount}" if quantity and discount else item)
+        else:
+            add(item)
+    return "; ".join(parts) if parts else None
 
 
 def unwrap_detail_payload(payload: Any) -> Dict[str, Any]:
@@ -375,6 +397,7 @@ def normalize_child(child_asin: str, detail: Mapping[str, Any], inventory: Optio
         detail.get("availability"),
         find_nested_value(detail, DELIVERY_KEYS),
     )
+    front_inventory = parse_inventory(detail.get("inStock") or detail.get("stock") or detail.get("stockStatus") or detail.get("availability"))
     frequently_returned = parse_bool(return_badge)
     if frequently_returned is None and contains_text(detail, RETURN_BADGE_TEXT_PATTERNS):
         frequently_returned = True
@@ -386,7 +409,8 @@ def normalize_child(child_asin: str, detail: Mapping[str, Any], inventory: Optio
         "coupon": coupon if coupon is not None else ("" if has_detail else None),
         "promotion": promotion if promotion is not None else ("" if has_detail else None),
         "frequently_returned": frequently_returned,
-        "inventory": inventory,
+        "inventory": inventory if inventory is not None else front_inventory,
+        "inventory_source": "xingshang" if inventory is not None else ("front_detail" if front_inventory is not None else None),
         "fulfillment_method": first_text(
             detail.get("fulfillment")
             or detail.get("fulfillmentMethod")
