@@ -252,6 +252,23 @@ def normalize_delivery(value: Any) -> Optional[str]:
     return first_text(value)
 
 
+def normalize_promotion(detail: Mapping[str, Any]) -> Optional[str]:
+    text = first_text(
+        detail.get("promotion")
+        or detail.get("promotions")
+        or detail.get("deal")
+        or detail.get("dealBadge")
+        or detail.get("dealType")
+        or detail.get("discountTypes")
+    )
+    if not text:
+        return None
+    lower = text.lower()
+    if "amazon's choice" in lower or "amazon choice" in lower or "best seller" in lower:
+        return None
+    return text
+
+
 def unwrap_detail_payload(payload: Any) -> Dict[str, Any]:
     if not isinstance(payload, Mapping):
         return {}
@@ -299,7 +316,7 @@ def normalize_child(child_asin: str, detail: Mapping[str, Any], inventory: Optio
     badge = detail.get("badge") if isinstance(detail.get("badge"), Mapping) else {}
     has_detail = any(key != "asin" for key in detail)
     coupon = first_text(detail.get("coupon") or detail.get("couponInfo") or detail.get("couponText"))
-    promotion = first_text(detail.get("promotion") or detail.get("deal") or detail.get("badge") or detail.get("badges"))
+    promotion = normalize_promotion(detail)
     return_badge = first_present(
         detail.get("frequentlyReturned"),
         detail.get("frequently_returned"),
@@ -331,6 +348,25 @@ def normalize_child(child_asin: str, detail: Mapping[str, Any], inventory: Optio
         "delivery_promise": normalize_delivery(delivery),
         "source": source,
     }
+
+
+def merge_missing_detail(primary: Mapping[str, Any], fallback: Mapping[str, Any]) -> Dict[str, Any]:
+    merged = dict(primary)
+    for key, value in fallback.items():
+        current = merged.get(key)
+        if current in (None, "", [], {}):
+            merged[key] = value
+    return merged
+
+
+def parent_needs_supplement(parent_asin: str, detail: Mapping[str, Any]) -> bool:
+    parent = normalize_parent(parent_asin, {**detail, "asin": parent_asin}, "pangolin")
+    return parent.get("rating_count") is None or not parent.get("child_asins")
+
+
+def child_needs_supplement(child_asin: str, detail: Mapping[str, Any]) -> bool:
+    child = normalize_child(child_asin, {**detail, "asin": child_asin}, None, "pangolin")
+    return child.get("price") is None or child.get("fulfillment_method") is None
 
 
 def inventory_by_asin(payload: Mapping[str, Any]) -> Dict[str, Optional[int]]:
@@ -587,6 +623,11 @@ def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, 
             parent_detail, parent_source = fetch_fallback_detail(config, parent_asin, marketplace, snapshot["errors"], "parent")
             if parent_detail and parent_pangolin_empty:
                 snapshot["warnings"].append(f"{parent_asin}: pangolin parent empty; using {parent_source}")
+        elif parent_source == "pangolin" and parent_needs_supplement(parent_asin, parent_detail):
+            fallback_detail, fallback_source = fetch_fallback_detail(config, parent_asin, marketplace, snapshot["errors"], "parent")
+            if fallback_detail:
+                parent_detail = merge_missing_detail(parent_detail, fallback_detail)
+                snapshot["warnings"].append(f"{parent_asin}: pangolin parent partial; supplemented by {fallback_source}")
         if not parent_detail:
             parent_source = "xingshang_inventory_only"
             snapshot["errors"].append(f"{parent_asin}: 前台数据缺失")
@@ -635,6 +676,11 @@ def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, 
                     snapshot["errors"].append(f"{child_asin}: pangolin child failed: {describe_exception(exc, timeout=pangolin_timeout)}")
             if not detail:
                 detail, child_source = fetch_fallback_detail(config, child_asin, marketplace, snapshot["errors"], "child")
+            elif child_source == "pangolin" and child_needs_supplement(child_asin, detail):
+                fallback_detail, fallback_source = fetch_fallback_detail(config, child_asin, marketplace, snapshot["errors"], "child")
+                if fallback_detail:
+                    detail = merge_missing_detail(detail, fallback_detail)
+                    child_source = f"pangolin+{fallback_source}"
             if not detail:
                 child_source = "xingshang_inventory_only"
                 snapshot["errors"].append(f"{child_asin}: 前台数据缺失")
@@ -735,11 +781,74 @@ def send_feishu(text: str, webhook_url: str, secret: str = "") -> None:
     )
 
 
-def format_message(changes: Sequence[str], *, baseline: bool = False) -> str:
+FIELD_LABELS = {
+    "major_rank": "大类排名",
+    "minor_rank": "小类排名",
+    "stars": "评分",
+    "rating_count": "评论数",
+    "price": "价格",
+    "coupon": "Coupon",
+    "promotion": "促销/Deal",
+    "frequently_returned": "高退货率标签",
+    "inventory": "库存",
+    "fulfillment_method": "配送方式",
+    "delivery_promise": "配送时效",
+}
+
+
+def format_change_value(value: Any) -> str:
+    if value in {None, "None", ""}:
+        return "未知"
+    if value == "False":
+        return "否"
+    if value == "True":
+        return "是"
+    return str(value)
+
+
+def format_message(changes: Sequence[str], *, baseline: bool = False, captured_at: Optional[str] = None) -> str:
     if baseline:
         return "ASIN monitor baseline established. 后续每日 09:00 有变化时提醒。"
-    head = f"ASIN monitor detected {len(changes)} change(s):"
-    return head + "\n" + "\n".join(f"- {line}" for line in changes[:80])
+    parents: Dict[str, List[str]] = {}
+    children: Dict[str, List[str]] = {}
+    membership: List[str] = []
+    errors: List[str] = []
+    for raw in changes:
+        line = str(raw)
+        match = re.fullmatch(r"([A-Z0-9]{10}) parent ([a-z_]+): (.*) -> (.*)", line)
+        if match:
+            asin, field, before, after = match.groups()
+            parents.setdefault(asin, []).append(f"- {FIELD_LABELS.get(field, field)}：{format_change_value(before)} → {format_change_value(after)}")
+            continue
+        match = re.fullmatch(r"([A-Z0-9]{10}) child ([a-z_]+): (.*) -> (.*)", line)
+        if match:
+            asin, field, before, after = match.groups()
+            children.setdefault(asin, []).append(f"{FIELD_LABELS.get(field, field)}：{format_change_value(before)} → {format_change_value(after)}")
+            continue
+        match = re.fullmatch(r"([A-Z0-9]{10}) child (added|removed): ([A-Z0-9]{10})", line)
+        if match:
+            parent_asin, action, child_asin = match.groups()
+            label = "新增" if action == "added" else "解绑"
+            membership.append(f"- {label}：{parent_asin} / {child_asin}")
+            continue
+        errors.append(line)
+    lines = [f"ASIN 变化提醒｜{format_report_time(captured_at or now_iso())}", f"状态：发现 {len(changes)} 项变化"]
+    if parents:
+        for asin in sorted(parents):
+            lines.extend(["", f"父 ASIN {asin}", "", "父体变化："])
+            lines.extend(parents[asin])
+    if children:
+        lines.extend(["", "子体变化："])
+        for index, asin in enumerate(sorted(children), 1):
+            lines.append(f"{index}. {asin}")
+            lines.extend(f"   {item}" for item in children[asin])
+    if membership:
+        lines.extend(["", "子体关系："])
+        lines.extend(membership)
+    if errors:
+        lines.extend(["", "数据源异常："])
+        lines.extend(f"- {line}" for line in errors[:20])
+    return "\n".join(lines)
 
 
 def format_rank(rank: Any, category: Any) -> str:
@@ -814,8 +923,11 @@ def format_source_summary(snapshot: Mapping[str, Any], parent: Mapping[str, Any]
     inventory = format_source(parent.get("inventory_source")) if parent.get("inventory_source") else "未覆盖"
     parts = [f"前台 {front}", f"库存 {inventory}"]
     if snapshot.get("warnings"):
-        if any("pangolin" in str(warning).lower() for warning in snapshot.get("warnings") or []):
+        pangolin_warnings = [str(warning).lower() for warning in snapshot.get("warnings") or [] if "pangolin" in str(warning).lower()]
+        if any("empty" in warning for warning in pangolin_warnings):
             parts.append("Pangolinfo 空结果已补源")
+        elif pangolin_warnings:
+            parts.append("Pangolinfo 部分字段已补源")
         if parent.get("inventory_source") == "previous_snapshot":
             parts.append("xingshang 异常，库存沿用上次快照")
     return "；".join(parts)
@@ -844,6 +956,7 @@ def format_snapshot_report(snapshot: Mapping[str, Any]) -> str:
                 f"价 {format_value(child.get('price'))}｜"
                 f"库存 {format_value(child.get('inventory'))}｜"
                 f"Coupon {format_optional_text(child.get('coupon'), child)}｜"
+                f"促销 {format_optional_text(child.get('promotion'), child)}｜"
                 f"配送 {format_coverage(child.get('fulfillment_method'), child)}｜"
                 f"退货 {format_coverage(child.get('frequently_returned'), child)}｜"
                 f"时效 {format_coverage(child.get('delivery_promise'), child)}"

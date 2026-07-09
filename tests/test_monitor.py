@@ -70,7 +70,7 @@ class MonitorTest(unittest.TestCase):
                 }
             },
             "children": {
-                "CHILD00001": {"price": 11.0, "inventory": 0, "coupon": "5% coupon"},
+                "CHILD00001": {"price": 11.0, "inventory": 0, "coupon": "5% coupon", "promotion": "7-Day Deal"},
                 "NEWCHILD01": {"price": 12.0},
             },
             "errors": ["PARENT1234: xingshang failed"],
@@ -85,7 +85,20 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("PARENT1234 child removed: OLDCHILD01", lines)
         self.assertIn("CHILD00001 child price: 10.0 -> 11.0", lines)
         self.assertIn("CHILD00001 child inventory: 3 -> 0", lines)
+        self.assertIn("CHILD00001 child promotion: None -> 7-Day Deal", lines)
         self.assertIn("PARENT1234: xingshang failed", lines)
+
+        message = monitor.format_message(changes, captured_at="2026-07-10T01:00:12Z")
+
+        self.assertIn("ASIN 变化提醒｜北京时间 2026-07-10 09:00:12", message)
+        self.assertIn("状态：发现 9 项变化", message)
+        self.assertIn("父 ASIN PARENT1234", message)
+        self.assertIn("大类排名：5 → 7", message)
+        self.assertIn("评论数：100 → 101", message)
+        self.assertIn("1. CHILD00001", message)
+        self.assertIn("价格：10.0 → 11.0", message)
+        self.assertIn("促销/Deal：未知 → 7-Day Deal", message)
+        self.assertIn("数据源异常：", message)
 
     def test_feishu_payload_uses_optional_signature(self):
         unsigned = monitor.feishu_payload("hello", timestamp=123, secret="")
@@ -124,7 +137,7 @@ class MonitorTest(unittest.TestCase):
                 "CHILD00001": {
                     "price": 23.99,
                     "coupon": "10% coupon",
-                    "promotion": "",
+                    "promotion": "7-Day Deal",
                     "frequently_returned": False,
                     "inventory": 7,
                     "fulfillment_method": "FBA",
@@ -143,6 +156,7 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("CHILD00001", message)
         self.assertIn("价 23.99", message)
         self.assertIn("库存 7", message)
+        self.assertIn("促销 7-Day Deal", message)
 
     def test_unwraps_sellersprite_detail_payload(self):
         payload = {
@@ -193,6 +207,18 @@ class MonitorTest(unittest.TestCase):
 
         self.assertEqual(child["delivery_promise"], "Tomorrow, Jul 10")
         self.assertTrue(child["frequently_returned"])
+
+    def test_normalizes_deal_without_treating_amazon_choice_as_promotion(self):
+        deal = monitor.normalize_child("B0FFT34472", {"promotions": ["Limited time deal"]}, None, "pangolin")
+        choice = monitor.normalize_child(
+            "B0FFT34472",
+            {"badge": "Amazon's Choice highlights highly rated, well-priced products available to ship immediately."},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(deal["promotion"], "Limited time deal")
+        self.assertEqual(choice["promotion"], "")
 
     def test_pangolin_error_response_is_not_treated_as_empty(self):
         with self.assertRaisesRegex(monitor.MonitorError, "账户已过期"):
@@ -322,6 +348,39 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("B0FVX93K44", snapshot["parents"]["B0FFT1JQ9T"]["child_asins"])
         self.assertTrue(any("xingshang failed" in error for error in snapshot["errors"]))
 
+    def test_collect_snapshot_supplements_partial_pangolin_child_from_fallback(self):
+        def fake_pangolin(token, parser_name, content, *, site, zipcode, timeout):
+            if content == "B0FFT1JQ9T":
+                return {"data": {"json": {"data": {"results": [{"asin": content, "variationList": [{"asin": "B0FVX93K44"}]}]}}}}
+            return {"data": {"json": {"data": {"results": [{"asin": content, "coupon": ""}]}}}}
+
+        def fake_fallback(config, asin, marketplace, errors, label):
+            if label == "parent":
+                return {"asin": asin, "ratings": 59}, "SELLERSPRITE_MCP_URL"
+            return {"asin": asin, "price": 89.99, "coupon": "", "fulfillment": "AMZ"}, "SELLERSPRITE_MCP_URL"
+
+        with (
+            patch("monitor.pangolin_scrape", side_effect=fake_pangolin),
+            patch("monitor.fetch_fallback_detail", side_effect=fake_fallback),
+            patch("monitor.fetch_inventory", return_value={"items": [{"asin": "B0FVX93K44", "inventory": 70}]}),
+        ):
+            snapshot = monitor.collect_snapshot(
+                {
+                    "PANGOLINFO_API_TOKEN": "token",
+                    "MONITOR_PARENT_ASINS": "B0FFT1JQ9T",
+                    "XINGSHANG_MCP_URL_TEMPLATE": "https://example.com/{parent_asin}",
+                    "MARKETPLACE": "US",
+                    "PANGOLIN_ZIPCODE": "10041",
+                    "PANGOLIN_TIMEOUT_SECONDS": "1",
+                    "MCP_TIMEOUT_SECONDS": "1",
+                }
+            )
+
+        child = snapshot["children"]["B0FVX93K44"]
+        self.assertEqual(child["price"], 89.99)
+        self.assertEqual(child["fulfillment_method"], "AMZ")
+        self.assertEqual(child["inventory"], 70)
+
     def test_sellersprite_mcp_uses_secret_key_header(self):
         captured = {}
 
@@ -378,7 +437,7 @@ class MonitorTest(unittest.TestCase):
                 }
             },
             "children": {
-                "B0FFT34472": {"price": 85.53, "coupon": "", "inventory": 295, "fulfillment_method": "AMZ", "source": "SELLERSPRITE_MCP_URL"},
+                "B0FFT34472": {"price": 85.53, "coupon": "", "promotion": "7-Day Deal", "inventory": 295, "fulfillment_method": "AMZ", "source": "SELLERSPRITE_MCP_URL"},
                 "B0FVX93K44": {"price": 89.99, "coupon": "", "inventory": 70, "fulfillment_method": "AMZ", "source": "SELLERSPRITE_MCP_URL"},
             },
             "warnings": [
@@ -392,7 +451,7 @@ class MonitorTest(unittest.TestCase):
 
         self.assertIn("状态：完整数据（SellerSprite 补源）", message)
         self.assertIn("子体：2", message)
-        self.assertIn("B0FFT34472｜价 85.53｜库存 295｜Coupon 无｜配送 AMZ｜退货 未覆盖｜时效 未覆盖", message)
+        self.assertIn("B0FFT34472｜价 85.53｜库存 295｜Coupon 无｜促销 7-Day Deal｜配送 AMZ｜退货 未覆盖｜时效 未覆盖", message)
         self.assertIn("数据源：前台 SellerSprite；库存 xingshang；Pangolinfo 空结果已补源", message)
         self.assertNotIn("SELLERSPRITE_MCP_URL", message)
         self.assertNotIn("pangolin child empty", message)
