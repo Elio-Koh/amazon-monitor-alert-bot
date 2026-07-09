@@ -33,6 +33,7 @@ CHILD_FIELDS = (
     "delivery_promise",
 )
 SITE_BY_MARKETPLACE = {"US": "amz_us", "CA": "amz_ca", "UK": "amz_uk", "DE": "amz_de", "AU": "amz_au", "MX": "amz_mx"}
+ASIN_PATTERN = re.compile(r"^[A-Z0-9]{10}$")
 
 
 class MonitorError(RuntimeError):
@@ -90,6 +91,16 @@ def config_int(config: Mapping[str, str], key: str, default: int) -> int:
     return value if value is not None and value > 0 else default
 
 
+def config_bool(config: Mapping[str, str], key: str, default: bool = False) -> bool:
+    value = parse_bool(config.get(key))
+    return default if value is None else value
+
+
+def is_asin(value: Any) -> bool:
+    text = first_text(value)
+    return bool(text and ASIN_PATTERN.fullmatch(text.upper()))
+
+
 def parse_bool(value: Any) -> Optional[bool]:
     if isinstance(value, bool):
         return value
@@ -142,15 +153,16 @@ def extract_child_asins(detail: Mapping[str, Any]) -> List[str]:
     found: List[str] = []
     candidates = [
         detail.get("variationList"),
-        detail.get("variations"),
         detail.get("variationAsins"),
         detail.get("childAsins"),
         detail.get("children"),
     ]
+    if isinstance(detail.get("variations"), list):
+        candidates.append(detail.get("variations"))
     for value in candidates:
         for item in listify(value):
             asin = first_text(item.get("asin") if isinstance(item, Mapping) else item)
-            if asin:
+            if asin and is_asin(asin):
                 found.append(asin.upper())
     return sorted(set(found))
 
@@ -178,18 +190,6 @@ def unwrap_detail_payload(payload: Any) -> Dict[str, Any]:
     if "couponTrends" in data:
         out["couponTrends"] = data["couponTrends"]
     return out
-
-
-def coupon_from_trends(value: Any) -> Optional[str]:
-    trends = [item for item in listify(value) if isinstance(item, Mapping)]
-    if not trends:
-        return None
-    latest = trends[-1]
-    coupon = parse_float(latest.get("couponPrice"))
-    final = parse_float(latest.get("finalPrice"))
-    if coupon is None:
-        return None
-    return f"coupon {coupon:g}; final {final:g}" if final is not None else f"coupon {coupon:g}"
 
 
 def normalize_parent(parent_asin: str, detail: Mapping[str, Any], source: str) -> Dict[str, Any]:
@@ -223,7 +223,7 @@ def normalize_parent(parent_asin: str, detail: Mapping[str, Any], source: str) -
 def normalize_child(child_asin: str, detail: Mapping[str, Any], inventory: Optional[int], source: str) -> Dict[str, Any]:
     badge = detail.get("badge") if isinstance(detail.get("badge"), Mapping) else {}
     has_detail = any(key != "asin" for key in detail)
-    coupon = first_text(detail.get("coupon") or detail.get("couponInfo") or detail.get("couponText")) or coupon_from_trends(detail.get("couponTrends"))
+    coupon = first_text(detail.get("coupon") or detail.get("couponInfo") or detail.get("couponText"))
     promotion = first_text(detail.get("promotion") or detail.get("deal") or detail.get("badge") or detail.get("badges"))
     return {
         "asin": child_asin.upper(),
@@ -397,11 +397,11 @@ def run_mcp(coro: Any, timeout: int) -> Any:
     return asyncio.run(asyncio.wait_for(coro, timeout=timeout))
 
 
-def fetch_inventory(parent_asin: str, url_template: str, timeout: int = 30) -> Dict[str, Any]:
+def fetch_inventory(parent_asin: str, url_template: str, timeout: int = 30, force_refresh: bool = False) -> Dict[str, Any]:
     if not url_template:
         return {}
     server_url = url_template.format(parent_asin=parent_asin.upper(), PARENT_ASIN=parent_asin.upper())
-    return run_mcp(call_mcp_tool(server_url, ("get_store_asin_info",), {"spu_item_id_list": [parent_asin.upper()], "force_refresh": True}), timeout)
+    return run_mcp(call_mcp_tool(server_url, ("get_store_asin_info",), {"spu_item_id_list": [parent_asin.upper()], "force_refresh": force_refresh}), timeout)
 
 
 def fetch_optional_detail_from_mcp(
@@ -446,11 +446,19 @@ def fetch_fallback_detail(config: Mapping[str, str], asin: str, marketplace: str
     return {}, ""
 
 
+def describe_exception(exc: BaseException, *, timeout: Optional[int] = None) -> str:
+    message = str(exc).strip()
+    suffix = f", timeout {timeout}s" if timeout else ""
+    return f"{type(exc).__name__}{suffix}: {message}" if message else f"{type(exc).__name__}{suffix}"
+
+
 def collect_snapshot(config: Mapping[str, str]) -> Dict[str, Any]:
     site = SITE_BY_MARKETPLACE.get(config.get("MARKETPLACE", "US").upper(), "amz_us")
     marketplace = config.get("MARKETPLACE", "US").upper()
     pangolin_timeout = config_int(config, "PANGOLIN_TIMEOUT_SECONDS", 8)
     mcp_timeout = config_int(config, "MCP_TIMEOUT_SECONDS", 20)
+    xingshang_timeout = config_int(config, "XINGSHANG_TIMEOUT_SECONDS", mcp_timeout)
+    xingshang_force_refresh = config_bool(config, "XINGSHANG_FORCE_REFRESH", False)
     parents = [asin.strip().upper() for asin in config["MONITOR_PARENT_ASINS"].split(",") if asin.strip()]
     snapshot = {"schema_version": "1.0", "captured_at": now_iso(), "parents": {}, "children": {}, "errors": [], "warnings": []}
     for parent_asin in parents:
@@ -481,35 +489,45 @@ def collect_snapshot(config: Mapping[str, str]) -> Dict[str, Any]:
             snapshot["errors"].append(f"{parent_asin}: 前台数据缺失")
         parent = normalize_parent(parent_asin, {**parent_detail, "asin": parent_asin}, parent_source)
         try:
-            inventory_payload = fetch_inventory(parent_asin, config.get("XINGSHANG_MCP_URL_TEMPLATE", ""), timeout=mcp_timeout)
+            inventory_payload = fetch_inventory(
+                parent_asin,
+                config.get("XINGSHANG_MCP_URL_TEMPLATE", ""),
+                timeout=xingshang_timeout,
+                force_refresh=xingshang_force_refresh,
+            )
+            if inventory_payload:
+                parent["inventory_source"] = "xingshang"
         except Exception as exc:
             inventory_payload = {}
-            snapshot["errors"].append(f"{parent_asin}: xingshang failed: {exc}")
+            snapshot["errors"].append(f"{parent_asin}: xingshang failed: {describe_exception(exc, timeout=xingshang_timeout)}")
         child_asins = sorted(set(parent["child_asins"]) | set(inventory_by_asin(inventory_payload)))
         child_rows = []
+        prefer_fallback_for_children = parent_pangolin_empty and parent_source != "pangolin"
         for child_asin in child_asins:
             child_source = "pangolin"
             child_pangolin_empty = False
-            try:
-                rows = extract_results(
-                    pangolin_scrape(
-                        config["PANGOLINFO_API_TOKEN"],
-                        "amzProductDetail",
-                        child_asin,
-                        site=site,
-                        zipcode=config.get("PANGOLIN_ZIPCODE", "10041"),
-                        timeout=pangolin_timeout,
+            detail = {}
+            if prefer_fallback_for_children:
+                detail, child_source = fetch_fallback_detail(config, child_asin, marketplace, snapshot["errors"], "child")
+            else:
+                try:
+                    rows = extract_results(
+                        pangolin_scrape(
+                            config["PANGOLINFO_API_TOKEN"],
+                            "amzProductDetail",
+                            child_asin,
+                            site=site,
+                            zipcode=config.get("PANGOLIN_ZIPCODE", "10041"),
+                            timeout=pangolin_timeout,
+                        )
                     )
-                )
-                detail = rows[0] if rows else {}
-                child_pangolin_empty = not bool(rows)
-            except Exception as exc:
-                detail = {}
-                snapshot["errors"].append(f"{child_asin}: pangolin child failed: {exc}")
+                    detail = rows[0] if rows else {}
+                    child_pangolin_empty = not bool(rows)
+                except Exception as exc:
+                    detail = {}
+                    snapshot["errors"].append(f"{child_asin}: pangolin child failed: {describe_exception(exc, timeout=pangolin_timeout)}")
             if not detail:
                 detail, child_source = fetch_fallback_detail(config, child_asin, marketplace, snapshot["errors"], "child")
-                if detail and child_pangolin_empty:
-                    snapshot["warnings"].append(f"{child_asin}: pangolin child empty; using {child_source}")
             if not detail:
                 child_source = "xingshang_inventory_only"
                 snapshot["errors"].append(f"{child_asin}: 前台数据缺失")
@@ -652,10 +670,12 @@ def format_source(value: Any) -> str:
 def report_status(snapshot: Mapping[str, Any]) -> str:
     parents = snapshot.get("parents", {}) if isinstance(snapshot.get("parents"), Mapping) else {}
     children = snapshot.get("children", {}) if isinstance(snapshot.get("children"), Mapping) else {}
-    if any(not has_front_detail(row) for row in list(parents.values()) + list(children.values())):
-        return "部分数据：前台数据缺失"
     if snapshot.get("errors"):
         return "部分数据：数据源异常"
+    if any(not has_front_detail(row) for row in list(parents.values()) + list(children.values())):
+        return "部分数据：前台数据缺失"
+    if snapshot.get("warnings"):
+        return "完整数据（SellerSprite 补源）"
     return "完整数据"
 
 
@@ -667,8 +687,27 @@ def format_optional_text(value: Any, row: Mapping[str, Any]) -> str:
     return str(value)
 
 
+def format_coverage(value: Any, row: Optional[Mapping[str, Any]] = None) -> str:
+    if value is None:
+        return "未覆盖"
+    if value == "":
+        return "无" if row is None or has_front_detail(row) else "未覆盖"
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    return str(value)
+
+
+def format_source_summary(snapshot: Mapping[str, Any], parent: Mapping[str, Any]) -> str:
+    front = format_source(parent.get("source"))
+    inventory = format_source(parent.get("inventory_source")) if parent.get("inventory_source") else "未覆盖"
+    parts = [f"前台 {front}", f"库存 {inventory}"]
+    if snapshot.get("warnings"):
+        parts.append("Pangolinfo 空结果已补源")
+    return "；".join(parts)
+
+
 def format_snapshot_report(snapshot: Mapping[str, Any]) -> str:
-    lines = [f"ASIN 今日数据 ({snapshot.get('captured_at') or now_iso()})", f"状态: {report_status(snapshot)}"]
+    lines = [f"ASIN 今日数据｜{snapshot.get('captured_at') or now_iso()}", f"状态：{report_status(snapshot)}"]
     parents = snapshot.get("parents", {}) if isinstance(snapshot.get("parents"), Mapping) else {}
     children = snapshot.get("children", {}) if isinstance(snapshot.get("children"), Mapping) else {}
     for parent_asin in sorted(parents):
@@ -676,31 +715,26 @@ def format_snapshot_report(snapshot: Mapping[str, Any]) -> str:
         child_asins = [str(asin) for asin in parent.get("child_asins") or []]
         lines.append("")
         lines.append(f"父 ASIN {parent_asin}")
-        lines.append(f"- 前台数据源: {format_source(parent.get('source'))}")
         if not has_front_detail(parent):
             lines.append("- 前台数据缺失")
         lines.append(f"- 大类排名: {format_rank(parent.get('major_rank'), parent.get('major_category'))}")
         lines.append(f"- 小类排名: {format_rank(parent.get('minor_rank'), parent.get('minor_category'))}")
-        lines.append(f"- 星级: {format_value(parent.get('stars'))}")
-        lines.append(f"- 评论数: {format_value(parent.get('rating_count'))}")
-        lines.append(f"- 子 ASIN 数: {len(child_asins)}")
-        for child_asin in sorted(child_asins):
+        lines.append(f"- 评分：{format_value(parent.get('stars'))}｜评论：{format_value(parent.get('rating_count'))}｜子体：{len(child_asins)}")
+        lines.append("")
+        lines.append("子体明细：")
+        for index, child_asin in enumerate(sorted(child_asins), 1):
             child = children.get(child_asin, {})
             lines.append(
-                "- 子 ASIN "
-                f"{child_asin}: 价格: {format_value(child.get('price'))}; "
-                f"coupon: {format_optional_text(child.get('coupon'), child)}; "
-                f"促销: {format_optional_text(child.get('promotion'), child)}; "
-                f"frequently return: {format_value(child.get('frequently_returned'))}; "
-                f"库存: {format_value(child.get('inventory'))}; "
-                f"配送方式: {format_value(child.get('fulfillment_method'))}; "
-                f"配送时效: {format_value(child.get('delivery_promise'))}"
+                f"{index}. {child_asin}｜"
+                f"价 {format_value(child.get('price'))}｜"
+                f"库存 {format_value(child.get('inventory'))}｜"
+                f"Coupon {format_optional_text(child.get('coupon'), child)}｜"
+                f"配送 {format_coverage(child.get('fulfillment_method'), child)}｜"
+                f"退货 {format_coverage(child.get('frequently_returned'), child)}｜"
+                f"时效 {format_coverage(child.get('delivery_promise'), child)}"
             )
-    warnings = snapshot.get("warnings") or []
-    if warnings:
         lines.append("")
-        lines.append("数据源提示:")
-        lines.extend(f"- {warning}" for warning in warnings[:20])
+        lines.append(f"数据源：{format_source_summary(snapshot, parent)}")
     errors = snapshot.get("errors") or []
     if errors:
         lines.append("")
@@ -725,6 +759,8 @@ def env_config() -> Dict[str, str]:
         "PANGOLIN_ZIPCODE",
         "PANGOLIN_TIMEOUT_SECONDS",
         "MCP_TIMEOUT_SECONDS",
+        "XINGSHANG_TIMEOUT_SECONDS",
+        "XINGSHANG_FORCE_REFRESH",
         "FORCE_CURRENT_REPORT",
     ):
         config[optional] = os.environ.get(optional, "")

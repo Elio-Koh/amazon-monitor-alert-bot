@@ -141,8 +141,8 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("大类排名: 4335 (Home & Kitchen)", message)
         self.assertIn("小类排名: 16 (Milk Frothers)", message)
         self.assertIn("CHILD00001", message)
-        self.assertIn("价格: 23.99", message)
-        self.assertIn("库存: 7", message)
+        self.assertIn("价 23.99", message)
+        self.assertIn("库存 7", message)
 
     def test_unwraps_sellersprite_detail_payload(self):
         payload = {
@@ -156,7 +156,9 @@ class MonitorTest(unittest.TestCase):
                     "rating": 4.5,
                     "ratings": 59,
                     "price": 86.57,
+                    "coupon": "",
                     "fulfillment": "AMZ",
+                    "variations": 13,
                     "variationList": [{"asin": "B0FFT34472"}],
                 },
                 "couponTrends": [{"asinPrice": 70.99, "couponPrice": 5.68, "finalPrice": 65.31}],
@@ -173,8 +175,87 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(parent["rating_count"], 59)
         self.assertEqual(parent["child_asins"], ["B0FFT34472"])
         self.assertEqual(child["price"], 86.57)
-        self.assertEqual(child["coupon"], "coupon 5.68; final 65.31")
+        self.assertEqual(child["coupon"], "")
         self.assertEqual(child["fulfillment_method"], "AMZ")
+
+    def test_extract_child_asins_ignores_numeric_variations_and_invalid_asins(self):
+        detail = {
+            "variationList": [{"asin": "B0FFT34472"}],
+            "variations": 13,
+            "variationAsins": ["not-an-asin", "B0FFT2BF9L"],
+        }
+
+        self.assertEqual(monitor.extract_child_asins(detail), ["B0FFT2BF9L", "B0FFT34472"])
+
+    def test_fetch_inventory_defaults_to_non_force_refresh(self):
+        captured = {}
+
+        async def fake_call(server_url, fragments, args, headers=None):
+            captured["server_url"] = server_url
+            captured["fragments"] = tuple(fragments)
+            captured["args"] = dict(args)
+            return {"items": []}
+
+        with patch("monitor.call_mcp_tool", side_effect=fake_call):
+            monitor.fetch_inventory("B0FFT1JQ9T", "https://example.com/xingshang_config_{parent_asin}", timeout=1)
+
+        self.assertEqual(captured["server_url"], "https://example.com/xingshang_config_B0FFT1JQ9T")
+        self.assertEqual(captured["fragments"], ("get_store_asin_info",))
+        self.assertEqual(captured["args"]["force_refresh"], False)
+
+    def test_collect_snapshot_merges_inventory_children_without_fake_numeric_asin(self):
+        seller_children = [
+            "B0FFT34472",
+            "B0FFT2BF9L",
+            "B0FFSZ7J6L",
+            "B0FFT2PHP9",
+            "B0FFT28G1M",
+            "B0FFT37H43",
+            "B0FFT2KZYP",
+            "B0FFT1F3PD",
+            "B0FFT149KP",
+            "B0FFT45VX5",
+            "B0FFSZZ3BK",
+            "B0FFT149JM",
+            "B0FFT38NB4",
+        ]
+        inventory_children = seller_children + ["B0FVX93K44", "B0FVX6PTYC"]
+
+        def fake_fallback(config, asin, marketplace, errors, label):
+            if label == "parent":
+                return {
+                    "asin": asin,
+                    "bsrRank": 274790,
+                    "bsrLabel": "Home & Kitchen",
+                    "subcategories": [{"rank": 120, "label": "Kids' Table & Chair Sets"}],
+                    "rating": 4.5,
+                    "ratings": 59,
+                    "variations": 13,
+                    "variationList": [{"asin": child} for child in seller_children],
+                }, "SELLERSPRITE_MCP_URL"
+            return {"asin": asin, "price": 1.0, "coupon": "", "fulfillment": "AMZ"}, "SELLERSPRITE_MCP_URL"
+
+        with (
+            patch("monitor.pangolin_scrape", return_value={"data": {"json": {"data": {"results": []}}}}),
+            patch("monitor.fetch_fallback_detail", side_effect=fake_fallback),
+            patch("monitor.fetch_inventory", return_value={"items": [{"asin": asin, "inventory": index} for index, asin in enumerate(inventory_children, 1)]}),
+        ):
+            snapshot = monitor.collect_snapshot(
+                {
+                    "PANGOLINFO_API_TOKEN": "token",
+                    "MONITOR_PARENT_ASINS": "B0FFT1JQ9T",
+                    "XINGSHANG_MCP_URL_TEMPLATE": "https://example.com/{parent_asin}",
+                    "MARKETPLACE": "US",
+                    "PANGOLIN_ZIPCODE": "10041",
+                    "PANGOLIN_TIMEOUT_SECONDS": "1",
+                    "MCP_TIMEOUT_SECONDS": "1",
+                }
+            )
+
+        parent_children = snapshot["parents"]["B0FFT1JQ9T"]["child_asins"]
+        self.assertEqual(len(parent_children), 15)
+        self.assertNotIn("13", parent_children)
+        self.assertEqual(snapshot["children"]["B0FVX93K44"]["inventory"], 14)
 
     def test_sellersprite_mcp_uses_secret_key_header(self):
         captured = {}
@@ -211,8 +292,46 @@ class MonitorTest(unittest.TestCase):
         )
 
         self.assertIn("前台数据缺失", message)
-        self.assertIn("frequently return: 未知", message)
+        self.assertIn("退货 未覆盖", message)
         self.assertNotIn("frequently return: False", message)
+
+    def test_formats_compact_report_without_internal_source_noise(self):
+        child_asins = ["B0FFT34472", "B0FVX93K44"]
+        snapshot = {
+            "captured_at": "2026-07-09T03:52:28Z",
+            "parents": {
+                "B0FFT1JQ9T": {
+                    "major_rank": 274790,
+                    "major_category": "Home & Kitchen",
+                    "minor_rank": 120,
+                    "minor_category": "Kids' Table & Chair Sets",
+                    "stars": 4.5,
+                    "rating_count": 59,
+                    "child_asins": child_asins,
+                    "source": "SELLERSPRITE_MCP_URL",
+                    "inventory_source": "xingshang",
+                }
+            },
+            "children": {
+                "B0FFT34472": {"price": 85.53, "coupon": "", "inventory": 295, "fulfillment_method": "AMZ", "source": "SELLERSPRITE_MCP_URL"},
+                "B0FVX93K44": {"price": 89.99, "coupon": "", "inventory": 70, "fulfillment_method": "AMZ", "source": "SELLERSPRITE_MCP_URL"},
+            },
+            "warnings": [
+                "B0FFT1JQ9T: pangolin parent empty; using SELLERSPRITE_MCP_URL",
+                "B0FFT34472: pangolin child empty; using SELLERSPRITE_MCP_URL",
+            ],
+            "errors": [],
+        }
+
+        message = monitor.format_snapshot_report(snapshot)
+
+        self.assertIn("状态：完整数据（SellerSprite 补源）", message)
+        self.assertIn("子体：2", message)
+        self.assertIn("B0FFT34472｜价 85.53｜库存 295｜Coupon 无｜配送 AMZ｜退货 未覆盖｜时效 未覆盖", message)
+        self.assertIn("数据源：前台 SellerSprite；库存 xingshang；Pangolinfo 空结果已补源", message)
+        self.assertNotIn("SELLERSPRITE_MCP_URL", message)
+        self.assertNotIn("pangolin child empty", message)
+        self.assertNotIn("frequently return", message)
 
 
 if __name__ == "__main__":
