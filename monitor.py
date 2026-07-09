@@ -641,7 +641,7 @@ def describe_exception(exc: BaseException, *, timeout: Optional[int] = None) -> 
 def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     site = SITE_BY_MARKETPLACE.get(config.get("MARKETPLACE", "US").upper(), "amz_us")
     marketplace = config.get("MARKETPLACE", "US").upper()
-    pangolin_timeout = config_int(config, "PANGOLIN_TIMEOUT_SECONDS", 20)
+    pangolin_timeout = config_int(config, "PANGOLIN_TIMEOUT_SECONDS", 45)
     mcp_timeout = config_int(config, "MCP_TIMEOUT_SECONDS", 20)
     xingshang_timeout = config_int(config, "XINGSHANG_TIMEOUT_SECONDS", mcp_timeout)
     xingshang_force_refresh = config_bool(config, "XINGSHANG_FORCE_REFRESH", False)
@@ -1033,54 +1033,84 @@ def format_source_summary(snapshot: Mapping[str, Any], parent: Mapping[str, Any]
     return "；".join(parts)
 
 
-def format_snapshot_report(snapshot: Mapping[str, Any]) -> str:
-    lines = [f"ASIN 今日数据｜{format_report_time(snapshot.get('captured_at') or now_iso())}", f"状态：{report_status(snapshot)}"]
-    parents = snapshot.get("parents", {}) if isinstance(snapshot.get("parents"), Mapping) else {}
-    children = snapshot.get("children", {}) if isinstance(snapshot.get("children"), Mapping) else {}
-    for parent_asin in sorted(parents):
-        parent = parents[parent_asin]
-        child_asins = [str(asin) for asin in parent.get("child_asins") or []]
+def format_parent_snapshot_report(snapshot: Mapping[str, Any], parent_asin: str, parent: Mapping[str, Any], children: Mapping[str, Any]) -> str:
+    child_asins = [str(asin) for asin in parent.get("child_asins") or []]
+    inventory_only_asins = [str(asin) for asin in parent.get("inventory_only_asins") or []]
+    lines = [f"ASIN 今日数据｜{format_report_time(snapshot.get('captured_at') or now_iso())}", f"父 ASIN {parent_asin}"]
+    if not has_front_detail(parent):
+        lines.append("- 前台数据缺失")
+    lines.append(f"- 大类排名: {format_rank(parent.get('major_rank'), parent.get('major_category'))}")
+    lines.append(f"- 小类排名: {format_rank(parent.get('minor_rank'), parent.get('minor_category'))}")
+    lines.append(f"- 评分：{format_value(parent.get('stars'))}｜评论：{format_value(parent.get('rating_count'))}｜子体：{len(child_asins)}｜异常：{len(inventory_only_asins)}")
+    lines.append("")
+    lines.append("子体明细：")
+    for index, child_asin in enumerate(sorted(child_asins), 1):
+        child = children.get(child_asin, {})
+        lines.append(
+            f"{index}. {child_asin}｜"
+            f"价 {format_value(child.get('price'))}｜"
+            f"库存 {format_value(child.get('inventory'))}｜"
+            f"Coupon {format_optional_text(child.get('coupon'), child)}｜"
+            f"促销 {format_optional_text(child.get('promotion'), child)}｜"
+            f"配送 {format_coverage(child.get('fulfillment_method'), child)}｜"
+            f"退货 {format_coverage(child.get('frequently_returned'), child)}｜"
+            f"时效 {format_coverage(child.get('delivery_promise'), child)}"
+        )
+    if inventory_only_asins:
         lines.append("")
-        lines.append(f"父 ASIN {parent_asin}")
-        if not has_front_detail(parent):
-            lines.append("- 前台数据缺失")
-        lines.append(f"- 大类排名: {format_rank(parent.get('major_rank'), parent.get('major_category'))}")
-        lines.append(f"- 小类排名: {format_rank(parent.get('minor_rank'), parent.get('minor_category'))}")
-        lines.append(f"- 评分：{format_value(parent.get('stars'))}｜评论：{format_value(parent.get('rating_count'))}｜子体：{len(child_asins)}")
-        lines.append("")
-        lines.append("子体明细：")
-        for index, child_asin in enumerate(sorted(child_asins), 1):
+        lines.append("库存侧异常：")
+        for child_asin in sorted(inventory_only_asins):
             child = children.get(child_asin, {})
             lines.append(
-                f"{index}. {child_asin}｜"
-                f"价 {format_value(child.get('price'))}｜"
+                f"- {child_asin}｜"
                 f"库存 {format_value(child.get('inventory'))}｜"
-                f"Coupon {format_optional_text(child.get('coupon'), child)}｜"
-                f"促销 {format_optional_text(child.get('promotion'), child)}｜"
-                f"配送 {format_coverage(child.get('fulfillment_method'), child)}｜"
-                f"退货 {format_coverage(child.get('frequently_returned'), child)}｜"
-                f"时效 {format_coverage(child.get('delivery_promise'), child)}"
+                f"前台状态 {format_value(child.get('front_status'))}｜"
+                f"来源 xingshang"
             )
-        inventory_only_asins = [str(asin) for asin in parent.get("inventory_only_asins") or []]
-        if inventory_only_asins:
-            lines.append("")
-            lines.append("库存侧异常：")
-            for child_asin in sorted(inventory_only_asins):
-                child = children.get(child_asin, {})
-                lines.append(
-                    f"- {child_asin}｜"
-                    f"库存 {format_value(child.get('inventory'))}｜"
-                    f"前台状态 {format_value(child.get('front_status'))}｜"
-                    f"来源 xingshang"
-                )
-        lines.append("")
-        lines.append(f"数据源：{format_source_summary(snapshot, parent)}")
-    errors = snapshot.get("errors") or []
-    if errors:
-        lines.append("")
-        lines.append("数据源异常:")
-        lines.extend(f"- {error}" for error in errors[:20])
+    lines.append("")
+    lines.append(f"数据源：{format_source_summary(snapshot, parent)}")
     return "\n".join(lines)
+
+
+def format_snapshot_report_messages(snapshot: Mapping[str, Any]) -> List[str]:
+    captured_at = snapshot.get("captured_at") or now_iso()
+    parents = snapshot.get("parents", {}) if isinstance(snapshot.get("parents"), Mapping) else {}
+    children = snapshot.get("children", {}) if isinstance(snapshot.get("children"), Mapping) else {}
+    errors = [str(error) for error in snapshot.get("errors") or []]
+    total_children = sum(len(parent.get("child_asins") or []) for parent in parents.values() if isinstance(parent, Mapping))
+    total_inventory_only = sum(len(parent.get("inventory_only_asins") or []) for parent in parents.values() if isinstance(parent, Mapping))
+    overview = [
+        f"ASIN 今日数据总览｜{format_report_time(captured_at)}",
+        f"状态：{report_status(snapshot)}",
+        f"父 ASIN：{len(parents)}｜正常子体：{total_children}｜库存侧异常：{total_inventory_only}｜数据源异常：{len(errors)}",
+        "",
+        "父体摘要：",
+    ]
+    for index, parent_asin in enumerate(sorted(parents), 1):
+        parent = parents[parent_asin]
+        if not isinstance(parent, Mapping):
+            continue
+        child_count = len(parent.get("child_asins") or [])
+        inventory_only_count = len(parent.get("inventory_only_asins") or [])
+        overview.append(
+            f"{index}. {parent_asin}｜"
+            f"排名 {format_value(parent.get('major_rank'))} / {format_value(parent.get('minor_rank'))}｜"
+            f"评分 {format_value(parent.get('stars'))}｜"
+            f"评论 {format_value(parent.get('rating_count'))}｜"
+            f"子体 {child_count}｜异常 {inventory_only_count}"
+        )
+    messages = ["\n".join(overview)]
+    for parent_asin in sorted(parents):
+        parent = parents[parent_asin]
+        if isinstance(parent, Mapping):
+            messages.append(format_parent_snapshot_report(snapshot, parent_asin, parent, children))
+    if errors:
+        messages.append("数据源异常汇总:\n" + "\n".join(f"- {error}" for error in errors[:50]))
+    return messages
+
+
+def format_snapshot_report(snapshot: Mapping[str, Any]) -> str:
+    return "\n\n---\n\n".join(format_snapshot_report_messages(snapshot))
 
 
 def env_config() -> Dict[str, str]:
@@ -1121,19 +1151,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     previous = load_previous(args.state, config["STATE_ENCRYPTION_KEY"])
     current = collect_snapshot(config, previous=previous)
     changes = diff_snapshots(previous, current)
+    messages: List[str]
     if args.report_current or config.get("FORCE_CURRENT_REPORT", "").lower() == "true":
-        message = format_snapshot_report(current)
+        messages = format_snapshot_report_messages(current)
     elif previous is None:
-        message = format_message(changes, baseline=True)
+        messages = [format_message(changes, baseline=True)]
     elif changes:
-        message = format_message(changes)
+        messages = [format_message(changes)]
     else:
-        message = ""
-    if message:
+        messages = []
+    if messages:
         if args.dry_run:
-            print(message)
+            print("\n\n---\n\n".join(messages))
         else:
-            send_feishu(message, config["FEISHU_WEBHOOK_URL"], config.get("FEISHU_WEBHOOK_SECRET", ""))
+            for message in messages:
+                send_feishu(message, config["FEISHU_WEBHOOK_URL"], config.get("FEISHU_WEBHOOK_SECRET", ""))
+                time.sleep(0.5)
     if not current.get("errors"):
         save_current(args.output, current, config["STATE_ENCRYPTION_KEY"])
     elif previous is None:

@@ -158,6 +158,54 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("库存 7", message)
         self.assertIn("促销 7-Day Deal", message)
 
+    def test_formats_current_snapshot_report_as_grouped_messages(self):
+        snapshot = {
+            "captured_at": "2026-07-09T03:30:00Z",
+            "parents": {
+                "PARENT1234": {
+                    "major_rank": 4335,
+                    "major_category": "Home & Kitchen",
+                    "minor_rank": 16,
+                    "minor_category": "Milk Frothers",
+                    "stars": 4.7,
+                    "rating_count": 54,
+                    "child_asins": ["CHILD00001"],
+                    "inventory_only_asins": ["CHILD00002"],
+                    "inventory_source": "xingshang",
+                    "source": "pangolin",
+                },
+                "PARENT5678": {
+                    "major_rank": 99,
+                    "major_category": "Kitchen",
+                    "minor_rank": 3,
+                    "minor_category": "Tables",
+                    "stars": 4.1,
+                    "rating_count": 12,
+                    "child_asins": ["CHILD00003"],
+                    "inventory_source": "xingshang",
+                    "source": "pangolin",
+                },
+            },
+            "children": {
+                "CHILD00001": {"price": 23.99, "coupon": "", "promotion": "", "inventory": 7, "fulfillment_method": "FBA", "source": "pangolin"},
+                "CHILD00002": {"inventory": 2, "front_status": "不可售/404", "source": "xingshang_inventory_only"},
+                "CHILD00003": {"price": 33.99, "coupon": "5% coupon", "promotion": "Deal", "inventory": 8, "fulfillment_method": "AMZ", "source": "pangolin"},
+            },
+            "errors": ["CHILD00004: pangolin child failed"],
+        }
+
+        messages = monitor.format_snapshot_report_messages(snapshot)
+
+        self.assertEqual(len(messages), 4)
+        self.assertIn("ASIN 今日数据总览｜北京时间 2026-07-09 11:30:00", messages[0])
+        self.assertIn("父 ASIN：2｜正常子体：2｜库存侧异常：1｜数据源异常：1", messages[0])
+        self.assertIn("PARENT1234｜排名 4335 / 16｜评分 4.7｜评论 54｜子体 1｜异常 1", messages[0])
+        self.assertIn("父 ASIN PARENT1234", messages[1])
+        self.assertIn("CHILD00001｜价 23.99｜库存 7", messages[1])
+        self.assertIn("库存侧异常：", messages[1])
+        self.assertIn("父 ASIN PARENT5678", messages[2])
+        self.assertIn("数据源异常汇总:", messages[3])
+
     def test_unwraps_sellersprite_detail_payload(self):
         payload = {
             "code": "OK",
@@ -495,6 +543,49 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(parent["child_asins"], [])
         self.assertEqual(parent["inventory_only_asins"], ["B0FFT2PHP9"])
         self.assertEqual(snapshot["children"]["B0FFT2PHP9"]["front_status"], "不可售/404")
+
+    def test_collect_snapshot_defaults_pangolin_timeout_to_45(self):
+        captured = []
+
+        def fake_pangolin(token, parser_name, content, *, site, zipcode, timeout):
+            captured.append(timeout)
+            if content == "B0FFT1JQ9T":
+                return {
+                    "data": {
+                        "json": {
+                            "data": {
+                                "results": [
+                                    {
+                                        "asin": content,
+                                        "star": "4.5",
+                                        "rating": "(61)",
+                                        "variationList": [{"asin": "B0FFT34472"}],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            return {"data": {"json": {"data": {"results": [{"asin": content, "price": "$1.00", "fulfillment": "AMZ"}]}}}}
+
+        with (
+            patch("monitor.pangolin_scrape", side_effect=fake_pangolin),
+            patch("monitor.fetch_fallback_detail", return_value=({}, "")),
+            patch("monitor.fetch_inventory", return_value={"items": []}),
+        ):
+            monitor.collect_snapshot(
+                {
+                    "PANGOLINFO_API_TOKEN": "token",
+                    "MONITOR_PARENT_ASINS": "B0FFT1JQ9T",
+                    "XINGSHANG_MCP_URL_TEMPLATE": "https://example.com/{parent_asin}",
+                    "MARKETPLACE": "US",
+                    "PANGOLIN_ZIPCODE": "10041",
+                    "MCP_TIMEOUT_SECONDS": "1",
+                }
+            )
+
+        self.assertTrue(captured)
+        self.assertTrue(all(timeout == 45 for timeout in captured))
 
     def test_collect_snapshot_uses_previous_inventory_when_xingshang_times_out(self):
         previous = {
