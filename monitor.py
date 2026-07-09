@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from zoneinfo import ZoneInfo
 
 from cryptography.fernet import Fernet
 
@@ -27,14 +28,13 @@ CHILD_FIELDS = (
     "price",
     "coupon",
     "promotion",
-    "frequently_returned",
     "inventory",
-    "fulfillment_method",
     "delivery_promise",
 )
 SITE_BY_MARKETPLACE = {"US": "amz_us", "CA": "amz_ca", "UK": "amz_uk", "DE": "amz_de", "AU": "amz_au", "MX": "amz_mx"}
 ASIN_PATTERN = re.compile(r"^[A-Z0-9]{10}$")
 BEIJING_TZ = timezone(timedelta(hours=8))
+DELIVERY_TZ = ZoneInfo("America/New_York")
 DELIVERY_KEYS = {
     "delivery",
     "deliverydate",
@@ -98,6 +98,59 @@ def format_report_time(value: Any) -> str:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(BEIJING_TZ).strftime("北京时间 %Y-%m-%d %H:%M:%S")
+
+
+def report_base_date(captured_at: Any, tz: ZoneInfo = DELIVERY_TZ) -> datetime.date:
+    text = first_text(captured_at)
+    if text:
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            dt = datetime.now(timezone.utc)
+    else:
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz).date()
+
+
+def parse_delivery_date(text: str, base_date: datetime.date) -> Optional[datetime.date]:
+    cleaned = text.strip()
+    lower = cleaned.lower()
+    if lower.startswith("today"):
+        return base_date
+    if lower.startswith("tomorrow"):
+        day = base_date + timedelta(days=1)
+        cleaned = cleaned.split(",", 1)[1].strip() if "," in cleaned else ""
+    else:
+        day = base_date
+    for fmt in ("%A, %B %d", "%A, %b %d", "%B %d", "%b %d"):
+        try:
+            parsed = datetime.strptime(cleaned, fmt).date().replace(year=day.year)
+        except ValueError:
+            continue
+        if parsed < base_date:
+            parsed = parsed.replace(year=parsed.year + 1)
+        return parsed
+    return None
+
+
+def format_delivery_days(value: Any, captured_at: Any) -> str:
+    text = first_text(value)
+    if not text:
+        return "未覆盖"
+    base_date = report_base_date(captured_at)
+    parts = re.split(r";\s*fastest\s+", text, maxsplit=1, flags=re.I)
+    delivery = parse_delivery_date(parts[0], base_date)
+    if delivery is None:
+        return text
+    days = (delivery - base_date).days
+    out = f"{days}天（{delivery.month}/{delivery.day}"
+    if len(parts) > 1:
+        fastest = parse_delivery_date(parts[1], base_date)
+        if fastest is not None:
+            out += f"；最快{(fastest - base_date).days}天 {fastest.month}/{fastest.day}"
+    return out + "）"
 
 
 def first_text(value: Any) -> Optional[str]:
@@ -727,8 +780,6 @@ def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, 
                 timeout=xingshang_timeout,
                 force_refresh=xingshang_force_refresh,
             )
-            if inventory_payload:
-                parent["inventory_source"] = "xingshang"
         except Exception as exc:
             error = f"{parent_asin}: xingshang failed: {describe_exception(exc, timeout=xingshang_timeout)}"
             inventory_payload = previous_inventory_payload(previous, parent_asin)
@@ -737,6 +788,11 @@ def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, 
                 snapshot["warnings"].append(f"{parent_asin}: xingshang failed; using previous inventory snapshot")
             snapshot["errors"].append(error)
         inventories = inventory_by_asin(inventory_payload)
+        if parent.get("inventory_source") != "previous_snapshot":
+            if inventories:
+                parent["inventory_source"] = "xingshang"
+            elif inventory_payload:
+                parent["inventory_source"] = "xingshang_empty"
         source_child_asins = set(parent["child_asins"])
         candidate_asins = sorted(source_child_asins | set(inventories))
         child_asins: List[str] = []
@@ -1000,6 +1056,8 @@ def format_source(value: Any) -> str:
         return "Pangolinfo"
     if text == "xingshang_inventory_only":
         return "xingshang 库存"
+    if text == "xingshang_empty":
+        return "xingshang 未返回库存明细"
     if text == "previous_snapshot":
         return "上次快照"
     return text or "未知"
@@ -1042,10 +1100,13 @@ def format_coverage(value: Any, row: Optional[Mapping[str, Any]] = None) -> str:
     return str(value)
 
 
-def format_source_summary(snapshot: Mapping[str, Any], parent: Mapping[str, Any]) -> str:
+def format_source_summary(snapshot: Mapping[str, Any], parent: Mapping[str, Any], children: Optional[Mapping[str, Any]] = None) -> str:
     front = format_source(parent.get("source"))
     inventory = format_source(parent.get("inventory_source")) if parent.get("inventory_source") else "未覆盖"
     parts = [f"前台 {front}", f"库存 {inventory}"]
+    if children:
+        if any((children.get(str(asin), {}) or {}).get("inventory_source") == "front_detail" for asin in parent.get("child_asins") or []):
+            parts.append("部分库存来自前台低库存文案")
     if snapshot.get("warnings"):
         pangolin_warnings = [str(warning).lower() for warning in snapshot.get("warnings") or [] if "pangolin" in str(warning).lower()]
         if any("empty" in warning for warning in pangolin_warnings):
@@ -1076,9 +1137,7 @@ def format_parent_snapshot_report(snapshot: Mapping[str, Any], parent_asin: str,
             f"库存 {format_value(child.get('inventory'))}｜"
             f"Coupon {format_optional_text(child.get('coupon'), child)}｜"
             f"促销 {format_optional_text(child.get('promotion'), child)}｜"
-            f"配送 {format_coverage(child.get('fulfillment_method'), child)}｜"
-            f"退货 {format_coverage(child.get('frequently_returned'), child)}｜"
-            f"时效 {format_coverage(child.get('delivery_promise'), child)}"
+            f"时效 {format_delivery_days(child.get('delivery_promise'), snapshot.get('captured_at') or now_iso())}"
         )
     if inventory_only_asins:
         lines.append("")
@@ -1092,7 +1151,7 @@ def format_parent_snapshot_report(snapshot: Mapping[str, Any], parent_asin: str,
                 f"来源 xingshang"
             )
     lines.append("")
-    lines.append(f"数据源：{format_source_summary(snapshot, parent)}")
+    lines.append(f"数据源：{format_source_summary(snapshot, parent, children)}")
     return "\n".join(lines)
 
 

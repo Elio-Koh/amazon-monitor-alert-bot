@@ -206,6 +206,41 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("父 ASIN PARENT5678", messages[2])
         self.assertIn("数据源异常汇总:", messages[3])
 
+    def test_current_report_omits_fulfillment_and_return_badge(self):
+        snapshot = {
+            "captured_at": "2026-07-09T21:30:00Z",
+            "parents": {
+                "B0H1Q77TDL": {
+                    "major_rank": 10106,
+                    "minor_rank": 36,
+                    "stars": 4.5,
+                    "rating_count": 2,
+                    "child_asins": ["B0GJZYZHJJ"],
+                    "inventory_source": "xingshang_empty",
+                    "source": "pangolin",
+                }
+            },
+            "children": {
+                "B0GJZYZHJJ": {
+                    "price": 42.29,
+                    "coupon": "",
+                    "promotion": "10% off",
+                    "inventory": 16,
+                    "fulfillment_method": "Amazon.com",
+                    "frequently_returned": False,
+                    "delivery_promise": "Wednesday, July 15",
+                    "source": "pangolin",
+                }
+            },
+            "errors": [],
+        }
+
+        message = monitor.format_snapshot_report(snapshot)
+
+        self.assertIn("B0GJZYZHJJ｜价 42.29｜库存 16｜Coupon 无｜促销 10% off｜时效 6天（7/15）", message)
+        self.assertNotIn("配送 Amazon.com", message)
+        self.assertNotIn("退货", message)
+
     def test_unwraps_sellersprite_detail_payload(self):
         payload = {
             "code": "OK",
@@ -327,6 +362,13 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(child["inventory_source"], "front_detail")
         self.assertEqual(overridden["inventory"], 9)
         self.assertEqual(overridden["inventory_source"], "xingshang")
+
+    def test_formats_delivery_promise_as_days_in_new_york_time(self):
+        self.assertEqual(
+            monitor.format_delivery_days("Wednesday, July 15; fastest Tuesday, July 14", "2026-07-09T21:30:00Z"),
+            "6天（7/15；最快5天 7/14）",
+        )
+        self.assertEqual(monitor.format_delivery_days("Tomorrow, Jul 10", "2026-07-09T21:30:00Z"), "1天（7/10）")
 
     def test_pangolin_error_response_is_not_treated_as_empty(self):
         with self.assertRaisesRegex(monitor.MonitorError, "账户已过期"):
@@ -622,6 +664,32 @@ class MonitorTest(unittest.TestCase):
         self.assertTrue(captured)
         self.assertTrue(all(timeout == 45 for timeout in captured))
 
+    def test_collect_snapshot_marks_empty_xingshang_inventory_source(self):
+        def fake_pangolin(token, parser_name, content, *, site, zipcode, timeout):
+            if content == "B0H1Q77TDL":
+                return {"data": {"json": {"data": {"results": [{"asin": content, "variationList": [{"asin": "B0GJZYZHJJ"}]}]}}}}
+            return {"data": {"json": {"data": {"results": [{"asin": content, "price": "$42.29", "inStock": "Only 16 left in stock - order soon."}]}}}}
+
+        with (
+            patch("monitor.pangolin_scrape", side_effect=fake_pangolin),
+            patch("monitor.fetch_fallback_detail", return_value=({}, "")),
+            patch("monitor.fetch_inventory", return_value={"success": True, "items": []}),
+        ):
+            snapshot = monitor.collect_snapshot(
+                {
+                    "PANGOLINFO_API_TOKEN": "token",
+                    "MONITOR_PARENT_ASINS": "B0H1Q77TDL",
+                    "XINGSHANG_MCP_URL_TEMPLATE": "https://example.com/{parent_asin}",
+                    "MARKETPLACE": "US",
+                    "PANGOLIN_ZIPCODE": "10041",
+                    "MCP_TIMEOUT_SECONDS": "1",
+                }
+            )
+
+        self.assertEqual(snapshot["parents"]["B0H1Q77TDL"]["inventory_source"], "xingshang_empty")
+        self.assertEqual(snapshot["children"]["B0GJZYZHJJ"]["inventory"], 16)
+        self.assertIn("库存 xingshang 未返回库存明细", monitor.format_snapshot_report(snapshot))
+
     def test_collect_snapshot_uses_previous_inventory_when_xingshang_times_out(self):
         previous = {
             "parents": {"B0FFT1JQ9T": {"child_asins": ["B0FFT34472", "B0FVX93K44"]}},
@@ -758,7 +826,8 @@ class MonitorTest(unittest.TestCase):
         )
 
         self.assertIn("前台数据缺失", message)
-        self.assertIn("退货 未覆盖", message)
+        self.assertIn("时效 未覆盖", message)
+        self.assertNotIn("退货", message)
         self.assertNotIn("frequently return: False", message)
 
     def test_formats_compact_report_without_internal_source_noise(self):
@@ -795,7 +864,9 @@ class MonitorTest(unittest.TestCase):
 
         self.assertIn("状态：完整数据（SellerSprite 补源）", message)
         self.assertIn("子体：1", message)
-        self.assertIn("B0FFT34472｜价 85.53｜库存 295｜Coupon 无｜促销 7-Day Deal｜配送 AMZ｜退货 未覆盖｜时效 未覆盖", message)
+        self.assertIn("B0FFT34472｜价 85.53｜库存 295｜Coupon 无｜促销 7-Day Deal｜时效 未覆盖", message)
+        self.assertNotIn("配送 AMZ", message)
+        self.assertNotIn("退货", message)
         self.assertIn("库存侧异常：", message)
         self.assertIn("B0FVX93K44｜库存 70｜前台状态 不可售/404｜来源 xingshang", message)
         self.assertIn("数据源：前台 SellerSprite；库存 xingshang；Pangolinfo 空结果已补源", message)
