@@ -371,6 +371,8 @@ class MonitorTest(unittest.TestCase):
                 }
             if content == "B0FVX93K44":
                 return {"data": {"json": {"data": {"results": []}}}}
+            if content == "B0FFT2PHP9":
+                return {"data": {"json": {"data": {"results": [{"asin": "B0FFT149JM", "price": "$78.21", "fulfillment": "AMZ"}]}}}}
             return {"data": {"json": {"data": {"results": [{"asin": content, "price": "$1.00", "fulfillment": "AMZ"}]}}}}
 
         def fake_fallback(config, asin, marketplace, errors, label):
@@ -406,8 +408,53 @@ class MonitorTest(unittest.TestCase):
             )
 
         parent = snapshot["parents"]["B0FFT1JQ9T"]
-        self.assertEqual(parent["child_asins"], sorted(seller_children))
-        self.assertEqual(parent["inventory_only_asins"], ["B0FVX6PTYC", "B0FVX93K44"])
+        self.assertEqual(parent["child_asins"], sorted(set(seller_children) - {"B0FFT2PHP9"} | {"B0FVX6PTYC"}))
+        self.assertEqual(parent["inventory_only_asins"], ["B0FFT2PHP9", "B0FVX93K44"])
+        self.assertEqual(snapshot["children"]["B0FVX93K44"]["front_status"], "不可售/404")
+
+    def test_collect_snapshot_uses_front_detail_validity_for_live_children(self):
+        def fake_pangolin(token, parser_name, content, *, site, zipcode, timeout):
+            if content == "B0FFT1JQ9T":
+                return {"data": {"json": {"data": {"results": [{"asin": content, "variationList": [{"asin": "B0FFT2PHP9"}]}]}}}}
+            if content == "B0FFT2PHP9":
+                return {"data": {"json": {"data": {"results": [{"asin": "B0FFT149JM", "price": "$78.21", "fulfillment": "Amazon.com"}]}}}}
+            if content == "B0FVX6PTYC":
+                return {"data": {"json": {"data": {"results": [{"asin": content, "price": "$59.99", "fulfillment": "Amazon.com"}]}}}}
+            if content == "B0FVX93K44":
+                return {"data": {"json": {"data": {"results": [{"asin": content}]}}}}
+            return {"data": {"json": {"data": {"results": []}}}}
+
+        def fake_fallback(config, asin, marketplace, errors, label):
+            if label == "parent":
+                return {"asin": asin, "variationList": [{"asin": "B0FFT2PHP9"}]}, "SELLERSPRITE_MCP_URL"
+            return {"asin": asin, "price": 1.0, "fulfillment": "AMZ"}, "SELLERSPRITE_MCP_URL"
+
+        with (
+            patch("monitor.pangolin_scrape", side_effect=fake_pangolin),
+            patch("monitor.fetch_fallback_detail", side_effect=fake_fallback),
+            patch("monitor.fetch_inventory", return_value={"items": [{"asin": "B0FFT2PHP9", "inventory": 0}, {"asin": "B0FVX6PTYC", "inventory": 22}, {"asin": "B0FVX93K44", "inventory": 70}]}),
+        ):
+            snapshot = monitor.collect_snapshot(
+                {
+                    "PANGOLINFO_API_TOKEN": "token",
+                    "MONITOR_PARENT_ASINS": "B0FFT1JQ9T",
+                    "XINGSHANG_MCP_URL_TEMPLATE": "https://example.com/{parent_asin}",
+                    "MARKETPLACE": "US",
+                    "PANGOLIN_ZIPCODE": "10041",
+                    "PANGOLIN_TIMEOUT_SECONDS": "1",
+                    "MCP_TIMEOUT_SECONDS": "1",
+                    "SELLERSPRITE_MCP_URL": "https://mcp.sellersprite.com/mcp",
+                }
+            )
+
+        parent = snapshot["parents"]["B0FFT1JQ9T"]
+        self.assertEqual(parent["child_asins"], ["B0FVX6PTYC"])
+        self.assertEqual(parent["inventory_only_asins"], ["B0FFT2PHP9", "B0FVX93K44"])
+        self.assertIn("B0FFT2PHP9", parent["front_unavailable_asins"])
+        self.assertIn("B0FVX93K44", parent["front_unavailable_asins"])
+        self.assertEqual(snapshot["children"]["B0FVX6PTYC"]["price"], 59.99)
+        self.assertEqual(snapshot["children"]["B0FVX6PTYC"]["inventory"], 22)
+        self.assertEqual(snapshot["children"]["B0FFT2PHP9"]["front_status"], "不可售/404")
         self.assertEqual(snapshot["children"]["B0FVX93K44"]["front_status"], "不可售/404")
 
     def test_collect_snapshot_uses_previous_inventory_when_xingshang_times_out(self):

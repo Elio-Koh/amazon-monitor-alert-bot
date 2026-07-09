@@ -713,48 +713,16 @@ def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, 
                 snapshot["warnings"].append(f"{parent_asin}: xingshang failed; using previous inventory snapshot")
             snapshot["errors"].append(error)
         inventories = inventory_by_asin(inventory_payload)
-        child_asins = sorted(set(parent["child_asins"]))
-        inventory_only_asins = sorted(set(inventories) - set(child_asins))
+        source_child_asins = set(parent["child_asins"])
+        candidate_asins = sorted(source_child_asins | set(inventories))
+        child_asins: List[str] = []
+        inventory_only_asins: List[str] = []
         front_unavailable_asins: List[str] = []
         child_rows = []
-        prefer_fallback_for_children = parent_pangolin_empty and parent_source != "pangolin"
-        for child_asin in child_asins:
+        for child_asin in candidate_asins:
             child_source = "pangolin"
-            child_pangolin_empty = False
             detail = {}
-            if prefer_fallback_for_children:
-                detail, child_source = fetch_fallback_detail(config, child_asin, marketplace, snapshot["errors"], "child")
-            else:
-                try:
-                    rows = extract_results(
-                        pangolin_scrape(
-                            config["PANGOLINFO_API_TOKEN"],
-                            "amzProductDetail",
-                            child_asin,
-                            site=site,
-                            zipcode=config.get("PANGOLIN_ZIPCODE", "10041"),
-                            timeout=pangolin_timeout,
-                        )
-                    )
-                    detail = rows[0] if rows else {}
-                    child_pangolin_empty = not bool(rows)
-                except Exception as exc:
-                    detail = {}
-                    snapshot["errors"].append(f"{child_asin}: pangolin child failed: {describe_exception(exc, timeout=pangolin_timeout)}")
-            if not detail:
-                detail, child_source = fetch_fallback_detail(config, child_asin, marketplace, snapshot["errors"], "child")
-            elif child_source == "pangolin" and child_needs_supplement(child_asin, detail):
-                fallback_detail, fallback_source = fetch_fallback_detail(config, child_asin, marketplace, snapshot["errors"], "child")
-                if fallback_detail:
-                    detail = merge_missing_detail(detail, fallback_detail)
-                    child_source = f"pangolin+{fallback_source}"
-            if not detail:
-                child_source = "xingshang_inventory_only"
-                front_unavailable_asins.append(child_asin)
-                snapshot["errors"].append(f"{child_asin}: 前台数据缺失")
-            child_rows.append(normalize_child(child_asin, {**detail, "asin": child_asin}, inventory_by_asin(inventory_payload).get(child_asin), child_source))
-        for child_asin in inventory_only_asins:
-            front_status = "不在前台变体列表"
+            pangolin_failed = False
             try:
                 rows = extract_results(
                     pangolin_scrape(
@@ -767,23 +735,37 @@ def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, 
                     )
                 )
                 detail = rows[0] if rows else {}
-                if not front_detail_is_valid(detail, child_asin):
-                    front_status = "不可售/404"
-                    front_unavailable_asins.append(child_asin)
             except Exception as exc:
-                front_status = "前台状态未知"
-                snapshot["warnings"].append(f"{child_asin}: inventory-only front check failed: {describe_exception(exc, timeout=pangolin_timeout)}")
-            child_rows.append(
-                {
-                    "asin": child_asin,
-                    "inventory": inventories.get(child_asin),
-                    "front_status": front_status,
-                    "source": "xingshang_inventory_only",
-                }
-            )
+                detail = {}
+                pangolin_failed = True
+                snapshot["errors"].append(f"{child_asin}: pangolin child failed: {describe_exception(exc, timeout=pangolin_timeout)}")
+            detail_asin = first_text(detail.get("asin")) if detail else None
+            detail_matches_child = not detail_asin or (is_asin(detail_asin) and detail_asin.upper() == child_asin)
+            detail_valid = front_detail_is_valid(detail, child_asin) if detail else False
+            if not detail and (child_asin in source_child_asins or pangolin_failed):
+                detail, child_source = fetch_fallback_detail(config, child_asin, marketplace, snapshot["errors"], "child")
+            elif detail and child_source == "pangolin" and detail_matches_child and (child_asin in source_child_asins or detail_valid) and child_needs_supplement(child_asin, detail):
+                fallback_detail, fallback_source = fetch_fallback_detail(config, child_asin, marketplace, snapshot["errors"], "child")
+                if fallback_detail:
+                    detail = merge_missing_detail(detail, fallback_detail)
+                    child_source = f"pangolin+{fallback_source}"
+            if detail and front_detail_is_valid(detail, child_asin):
+                child_asins.append(child_asin)
+                child_rows.append(normalize_child(child_asin, detail, inventories.get(child_asin), child_source))
+            else:
+                inventory_only_asins.append(child_asin)
+                front_unavailable_asins.append(child_asin)
+                child_rows.append(
+                    {
+                        "asin": child_asin,
+                        "inventory": inventories.get(child_asin),
+                        "front_status": "不可售/404",
+                        "source": "xingshang_inventory_only",
+                    }
+                )
         children = merge_child_asins(parent, child_rows, inventory_payload)
-        parent["child_asins"] = child_asins
-        parent["inventory_only_asins"] = inventory_only_asins
+        parent["child_asins"] = sorted(set(child_asins))
+        parent["inventory_only_asins"] = sorted(set(inventory_only_asins))
         parent["front_unavailable_asins"] = sorted(set(front_unavailable_asins))
         snapshot["parents"][parent_asin] = parent
         snapshot["children"].update(children)
