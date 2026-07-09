@@ -39,6 +39,8 @@ jobs:
       SIF_MCP_URL: ${{ secrets.SIF_MCP_URL }}
       MARKETPLACE: ${{ secrets.MARKETPLACE || 'US' }}
       PANGOLIN_ZIPCODE: ${{ secrets.PANGOLIN_ZIPCODE || '10041' }}
+      PANGOLIN_TIMEOUT_SECONDS: ${{ secrets.PANGOLIN_TIMEOUT_SECONDS || '8' }}
+      MCP_TIMEOUT_SECONDS: ${{ secrets.MCP_TIMEOUT_SECONDS || '20' }}
       FORCE_CURRENT_REPORT: ${{ github.event_name == 'push' || github.event.inputs.current_report == 'true' }}
       STATE_BRANCH: monitor-state
       STATE_PATH: state/latest.enc.json
