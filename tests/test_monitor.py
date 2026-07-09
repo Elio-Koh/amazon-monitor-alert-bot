@@ -332,6 +332,84 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(snapshot["children"]["B0FVX93K44"]["inventory"], 14)
         self.assertEqual(snapshot["children"]["B0FVX93K44"]["front_status"], "不可售/404")
 
+    def test_collect_snapshot_uses_sellersprite_parent_variations_when_pangolin_is_partial(self):
+        seller_children = [
+            "B0FFT34472",
+            "B0FFT2BF9L",
+            "B0FFSZ7J6L",
+            "B0FFT2PHP9",
+            "B0FFT28G1M",
+            "B0FFT37H43",
+            "B0FFT2KZYP",
+            "B0FFT1F3PD",
+            "B0FFT149KP",
+            "B0FFT45VX5",
+            "B0FFSZZ3BK",
+            "B0FFT149JM",
+            "B0FFT38NB4",
+        ]
+        pangolin_children = seller_children[:8]
+        inventory_children = seller_children + ["B0FVX93K44", "B0FVX6PTYC"]
+
+        def fake_pangolin(token, parser_name, content, *, site, zipcode, timeout):
+            if content == "B0FFT1JQ9T":
+                return {
+                    "data": {
+                        "json": {
+                            "data": {
+                                "results": [
+                                    {
+                                        "asin": content,
+                                        "star": "4.5",
+                                        "rating": "(61)",
+                                        "variantDetails": [{"asin": child} for child in pangolin_children],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            if content == "B0FVX93K44":
+                return {"data": {"json": {"data": {"results": []}}}}
+            return {"data": {"json": {"data": {"results": [{"asin": content, "price": "$1.00", "fulfillment": "AMZ"}]}}}}
+
+        def fake_fallback(config, asin, marketplace, errors, label):
+            if label == "parent":
+                return {
+                    "asin": asin,
+                    "bsrRank": 274790,
+                    "bsrLabel": "Home & Kitchen",
+                    "subcategories": [{"rank": 120, "label": "Kids' Table & Chair Sets"}],
+                    "rating": 4.5,
+                    "ratings": 59,
+                    "variations": 13,
+                    "variationList": [{"asin": child} for child in seller_children],
+                }, "SELLERSPRITE_MCP_URL"
+            return {"asin": asin, "price": 1.0, "coupon": "", "fulfillment": "AMZ"}, "SELLERSPRITE_MCP_URL"
+
+        with (
+            patch("monitor.pangolin_scrape", side_effect=fake_pangolin),
+            patch("monitor.fetch_fallback_detail", side_effect=fake_fallback),
+            patch("monitor.fetch_inventory", return_value={"items": [{"asin": asin, "inventory": index} for index, asin in enumerate(inventory_children, 1)]}),
+        ):
+            snapshot = monitor.collect_snapshot(
+                {
+                    "PANGOLINFO_API_TOKEN": "token",
+                    "MONITOR_PARENT_ASINS": "B0FFT1JQ9T",
+                    "XINGSHANG_MCP_URL_TEMPLATE": "https://example.com/{parent_asin}",
+                    "MARKETPLACE": "US",
+                    "PANGOLIN_ZIPCODE": "10041",
+                    "PANGOLIN_TIMEOUT_SECONDS": "1",
+                    "MCP_TIMEOUT_SECONDS": "1",
+                    "SELLERSPRITE_MCP_URL": "https://mcp.sellersprite.com/mcp",
+                }
+            )
+
+        parent = snapshot["parents"]["B0FFT1JQ9T"]
+        self.assertEqual(parent["child_asins"], sorted(seller_children))
+        self.assertEqual(parent["inventory_only_asins"], ["B0FVX6PTYC", "B0FVX93K44"])
+        self.assertEqual(snapshot["children"]["B0FVX93K44"]["front_status"], "不可售/404")
+
     def test_collect_snapshot_uses_previous_inventory_when_xingshang_times_out(self):
         previous = {
             "parents": {"B0FFT1JQ9T": {"child_asins": ["B0FFT34472", "B0FVX93K44"]}},

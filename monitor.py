@@ -650,6 +650,8 @@ def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, 
     for parent_asin in parents:
         parent_source = "pangolin"
         parent_pangolin_empty = False
+        parent_variation_asins: List[str] = []
+        parent_variation_source = ""
         try:
             parent_rows = extract_results(
                 pangolin_scrape(
@@ -670,15 +672,30 @@ def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, 
             parent_detail, parent_source = fetch_fallback_detail(config, parent_asin, marketplace, snapshot["errors"], "parent")
             if parent_detail and parent_pangolin_empty:
                 snapshot["warnings"].append(f"{parent_asin}: pangolin parent empty; using {parent_source}")
-        elif parent_source == "pangolin" and parent_needs_supplement(parent_asin, parent_detail):
-            fallback_detail, fallback_source = fetch_fallback_detail(config, parent_asin, marketplace, snapshot["errors"], "parent")
-            if fallback_detail:
-                parent_detail = merge_missing_detail(parent_detail, fallback_detail)
-                snapshot["warnings"].append(f"{parent_asin}: pangolin parent partial; supplemented by {fallback_source}")
+        elif parent_source == "pangolin":
+            needs_supplement = parent_needs_supplement(parent_asin, parent_detail)
+            has_front_fallback = any(config.get(key) for key in ("SELLERSPRITE_MCP_URL", "SORFTIME_MCP_URL", "SIF_MCP_URL"))
+            if needs_supplement or has_front_fallback:
+                fallback_errors = snapshot["errors"] if needs_supplement else []
+                fallback_detail, fallback_source = fetch_fallback_detail(config, parent_asin, marketplace, fallback_errors, "parent")
+                if fallback_detail:
+                    fallback_child_asins = extract_child_asins(fallback_detail)
+                    pangolin_child_asins = extract_child_asins(parent_detail)
+                    if fallback_child_asins and set(fallback_child_asins) != set(pangolin_child_asins):
+                        parent_variation_asins = fallback_child_asins
+                        parent_variation_source = fallback_source
+                    if needs_supplement:
+                        parent_detail = merge_missing_detail(parent_detail, fallback_detail)
+                        snapshot["warnings"].append(f"{parent_asin}: pangolin parent partial; supplemented by {fallback_source}")
+                    elif parent_variation_asins:
+                        snapshot["warnings"].append(f"{parent_asin}: pangolin parent variations supplemented by {fallback_source}")
         if not parent_detail:
             parent_source = "xingshang_inventory_only"
             snapshot["errors"].append(f"{parent_asin}: 前台数据缺失")
         parent = normalize_parent(parent_asin, {**parent_detail, "asin": parent_asin}, parent_source)
+        if parent_variation_asins:
+            parent["child_asins"] = parent_variation_asins
+            parent["variation_source"] = parent_variation_source
         try:
             inventory_payload = fetch_inventory(
                 parent_asin,
