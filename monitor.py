@@ -85,6 +85,11 @@ def parse_int(value: Any) -> Optional[int]:
     return int(match.group(1).replace(",", "")) if match else None
 
 
+def config_int(config: Mapping[str, str], key: str, default: int) -> int:
+    value = parse_int(config.get(key))
+    return value if value is not None and value > 0 else default
+
+
 def parse_bool(value: Any) -> Optional[bool]:
     if isinstance(value, bool):
         return value
@@ -388,11 +393,15 @@ def mcp_result_to_json(result: Any) -> Any:
     return result
 
 
-def fetch_inventory(parent_asin: str, url_template: str) -> Dict[str, Any]:
+def run_mcp(coro: Any, timeout: int) -> Any:
+    return asyncio.run(asyncio.wait_for(coro, timeout=timeout))
+
+
+def fetch_inventory(parent_asin: str, url_template: str, timeout: int = 30) -> Dict[str, Any]:
     if not url_template:
         return {}
     server_url = url_template.format(parent_asin=parent_asin.upper(), PARENT_ASIN=parent_asin.upper())
-    return asyncio.run(call_mcp_tool(server_url, ("get_store_asin_info",), {"spu_item_id_list": [parent_asin.upper()], "force_refresh": True}))
+    return run_mcp(call_mcp_tool(server_url, ("get_store_asin_info",), {"spu_item_id_list": [parent_asin.upper()], "force_refresh": True}), timeout)
 
 
 def fetch_optional_detail_from_mcp(
@@ -402,10 +411,11 @@ def fetch_optional_detail_from_mcp(
     *,
     headers: Optional[Mapping[str, str]] = None,
     fragments: Iterable[str] = ("asin_detail",),
+    timeout: int = 30,
 ) -> Dict[str, Any]:
     if not server_url:
         return {}
-    payload = asyncio.run(call_mcp_tool(server_url, fragments, {"asin": asin.upper(), "marketplace": marketplace}, headers=headers))
+    payload = run_mcp(call_mcp_tool(server_url, fragments, {"asin": asin.upper(), "marketplace": marketplace}, headers=headers), timeout)
     return unwrap_detail_payload(payload)
 
 
@@ -416,6 +426,7 @@ def mcp_headers(config: Mapping[str, str], key: str) -> Dict[str, str]:
 
 
 def fetch_fallback_detail(config: Mapping[str, str], asin: str, marketplace: str, errors: List[str], label: str) -> tuple[Dict[str, Any], str]:
+    timeout = config_int(config, "MCP_TIMEOUT_SECONDS", 20)
     attempts = (
         ("SELLERSPRITE_MCP_URL", ("asin_detail_with_coupon_trend",)),
         ("SELLERSPRITE_MCP_URL", ("asin_detail",)),
@@ -426,7 +437,7 @@ def fetch_fallback_detail(config: Mapping[str, str], asin: str, marketplace: str
         if not config.get(key):
             continue
         try:
-            detail = fetch_optional_detail_from_mcp(config[key], asin, marketplace, headers=mcp_headers(config, key), fragments=fragments)
+            detail = fetch_optional_detail_from_mcp(config[key], asin, marketplace, headers=mcp_headers(config, key), fragments=fragments, timeout=timeout)
         except Exception as exc:
             errors.append(f"{asin}: {key} {label} failed: {exc}")
             continue
@@ -438,6 +449,8 @@ def fetch_fallback_detail(config: Mapping[str, str], asin: str, marketplace: str
 def collect_snapshot(config: Mapping[str, str]) -> Dict[str, Any]:
     site = SITE_BY_MARKETPLACE.get(config.get("MARKETPLACE", "US").upper(), "amz_us")
     marketplace = config.get("MARKETPLACE", "US").upper()
+    pangolin_timeout = config_int(config, "PANGOLIN_TIMEOUT_SECONDS", 8)
+    mcp_timeout = config_int(config, "MCP_TIMEOUT_SECONDS", 20)
     parents = [asin.strip().upper() for asin in config["MONITOR_PARENT_ASINS"].split(",") if asin.strip()]
     snapshot = {"schema_version": "1.0", "captured_at": now_iso(), "parents": {}, "children": {}, "errors": [], "warnings": []}
     for parent_asin in parents:
@@ -445,7 +458,14 @@ def collect_snapshot(config: Mapping[str, str]) -> Dict[str, Any]:
         parent_pangolin_empty = False
         try:
             parent_rows = extract_results(
-                pangolin_scrape(config["PANGOLINFO_API_TOKEN"], "amzProductDetail", parent_asin, site=site, zipcode=config.get("PANGOLIN_ZIPCODE", "10041"))
+                pangolin_scrape(
+                    config["PANGOLINFO_API_TOKEN"],
+                    "amzProductDetail",
+                    parent_asin,
+                    site=site,
+                    zipcode=config.get("PANGOLIN_ZIPCODE", "10041"),
+                    timeout=pangolin_timeout,
+                )
             )
             parent_detail = parent_rows[0] if parent_rows else {}
             parent_pangolin_empty = not bool(parent_rows)
@@ -461,7 +481,7 @@ def collect_snapshot(config: Mapping[str, str]) -> Dict[str, Any]:
             snapshot["errors"].append(f"{parent_asin}: 前台数据缺失")
         parent = normalize_parent(parent_asin, {**parent_detail, "asin": parent_asin}, parent_source)
         try:
-            inventory_payload = fetch_inventory(parent_asin, config.get("XINGSHANG_MCP_URL_TEMPLATE", ""))
+            inventory_payload = fetch_inventory(parent_asin, config.get("XINGSHANG_MCP_URL_TEMPLATE", ""), timeout=mcp_timeout)
         except Exception as exc:
             inventory_payload = {}
             snapshot["errors"].append(f"{parent_asin}: xingshang failed: {exc}")
@@ -472,7 +492,14 @@ def collect_snapshot(config: Mapping[str, str]) -> Dict[str, Any]:
             child_pangolin_empty = False
             try:
                 rows = extract_results(
-                    pangolin_scrape(config["PANGOLINFO_API_TOKEN"], "amzProductDetail", child_asin, site=site, zipcode=config.get("PANGOLIN_ZIPCODE", "10041"))
+                    pangolin_scrape(
+                        config["PANGOLINFO_API_TOKEN"],
+                        "amzProductDetail",
+                        child_asin,
+                        site=site,
+                        zipcode=config.get("PANGOLIN_ZIPCODE", "10041"),
+                        timeout=pangolin_timeout,
+                    )
                 )
                 detail = rows[0] if rows else {}
                 child_pangolin_empty = not bool(rows)
@@ -696,6 +723,8 @@ def env_config() -> Dict[str, str]:
         "SIF_MCP_URL",
         "MARKETPLACE",
         "PANGOLIN_ZIPCODE",
+        "PANGOLIN_TIMEOUT_SECONDS",
+        "MCP_TIMEOUT_SECONDS",
         "FORCE_CURRENT_REPORT",
     ):
         config[optional] = os.environ.get(optional, "")

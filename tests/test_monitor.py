@@ -193,6 +193,7 @@ class MonitorTest(unittest.TestCase):
                 "US",
                 headers={"secret-key": "secret"},
                 fragments=("asin_detail_with_coupon_trend",),
+                timeout=1,
             )
 
         self.assertEqual(detail["price"], 85.53)
