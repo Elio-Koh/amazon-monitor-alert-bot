@@ -1,0 +1,2 @@
+cryptography>=42.0,<43
+mcp>=1.9
