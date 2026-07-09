@@ -521,13 +521,60 @@ def format_message(changes: Sequence[str], *, baseline: bool = False) -> str:
     return head + "\n" + "\n".join(f"- {line}" for line in changes[:80])
 
 
+def format_rank(rank: Any, category: Any) -> str:
+    if rank is None:
+        return "缺失"
+    label = first_text(category)
+    return f"{rank} ({label})" if label else str(rank)
+
+
+def format_value(value: Any) -> str:
+    if value is None or value == "":
+        return "无"
+    return str(value)
+
+
+def format_snapshot_report(snapshot: Mapping[str, Any]) -> str:
+    lines = [f"ASIN 今日数据 ({snapshot.get('captured_at') or now_iso()})"]
+    parents = snapshot.get("parents", {}) if isinstance(snapshot.get("parents"), Mapping) else {}
+    children = snapshot.get("children", {}) if isinstance(snapshot.get("children"), Mapping) else {}
+    for parent_asin in sorted(parents):
+        parent = parents[parent_asin]
+        child_asins = [str(asin) for asin in parent.get("child_asins") or []]
+        lines.append("")
+        lines.append(f"父 ASIN {parent_asin}")
+        lines.append(f"- 大类排名: {format_rank(parent.get('major_rank'), parent.get('major_category'))}")
+        lines.append(f"- 小类排名: {format_rank(parent.get('minor_rank'), parent.get('minor_category'))}")
+        lines.append(f"- 星级: {format_value(parent.get('stars'))}")
+        lines.append(f"- 评论数: {format_value(parent.get('rating_count'))}")
+        lines.append(f"- 子 ASIN 数: {len(child_asins)}")
+        for child_asin in sorted(child_asins):
+            child = children.get(child_asin, {})
+            lines.append(
+                "- 子 ASIN "
+                f"{child_asin}: 价格: {format_value(child.get('price'))}; "
+                f"coupon: {format_value(child.get('coupon'))}; "
+                f"促销: {format_value(child.get('promotion'))}; "
+                f"frequently return: {format_value(child.get('frequently_returned'))}; "
+                f"库存: {format_value(child.get('inventory'))}; "
+                f"配送方式: {format_value(child.get('fulfillment_method'))}; "
+                f"配送时效: {format_value(child.get('delivery_promise'))}"
+            )
+    errors = snapshot.get("errors") or []
+    if errors:
+        lines.append("")
+        lines.append("数据源异常:")
+        lines.extend(f"- {error}" for error in errors[:20])
+    return "\n".join(lines)
+
+
 def env_config() -> Dict[str, str]:
     required = ["PANGOLINFO_API_TOKEN", "FEISHU_WEBHOOK_URL", "MONITOR_PARENT_ASINS", "STATE_ENCRYPTION_KEY", "XINGSHANG_MCP_URL_TEMPLATE"]
     config = {key: os.environ.get(key, "") for key in required}
     missing = [key for key, value in config.items() if not value]
     if missing:
         raise MonitorError("missing required env vars: " + ", ".join(missing))
-    for optional in ("FEISHU_WEBHOOK_SECRET", "SELLERSPRITE_MCP_URL", "SORFTIME_MCP_URL", "SIF_MCP_URL", "MARKETPLACE", "PANGOLIN_ZIPCODE"):
+    for optional in ("FEISHU_WEBHOOK_SECRET", "SELLERSPRITE_MCP_URL", "SORFTIME_MCP_URL", "SIF_MCP_URL", "MARKETPLACE", "PANGOLIN_ZIPCODE", "FORCE_CURRENT_REPORT"):
         config[optional] = os.environ.get(optional, "")
     config["MARKETPLACE"] = config.get("MARKETPLACE") or "US"
     config["PANGOLIN_ZIPCODE"] = config.get("PANGOLIN_ZIPCODE") or "10041"
@@ -539,13 +586,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--state", default="state/latest.enc.json")
     parser.add_argument("--output", default="state/latest.enc.json")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--report-current", action="store_true")
     args = parser.parse_args(argv)
 
     config = env_config()
     previous = load_previous(args.state, config["STATE_ENCRYPTION_KEY"])
     current = collect_snapshot(config)
     changes = diff_snapshots(previous, current)
-    if previous is None:
+    if args.report_current or config.get("FORCE_CURRENT_REPORT", "").lower() == "true":
+        message = format_snapshot_report(current)
+    elif previous is None:
         message = format_message(changes, baseline=True)
     elif changes:
         message = format_message(changes)

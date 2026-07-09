@@ -105,6 +105,44 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("data", decoded)
         self.assertEqual(monitor.decrypt_snapshot(encrypted, key), snapshot)
 
+    def test_formats_current_snapshot_report(self):
+        snapshot = {
+            "captured_at": "2026-07-09T03:30:00Z",
+            "parents": {
+                "PARENT1234": {
+                    "major_rank": 4335,
+                    "major_category": "Home & Kitchen",
+                    "minor_rank": 16,
+                    "minor_category": "Milk Frothers",
+                    "stars": 4.7,
+                    "rating_count": 54,
+                    "child_asins": ["CHILD00001"],
+                }
+            },
+            "children": {
+                "CHILD00001": {
+                    "price": 23.99,
+                    "coupon": "10% coupon",
+                    "promotion": "",
+                    "frequently_returned": False,
+                    "inventory": 7,
+                    "fulfillment_method": "FBA",
+                    "delivery_promise": "Tomorrow",
+                }
+            },
+            "errors": [],
+        }
+
+        message = monitor.format_snapshot_report(snapshot)
+
+        self.assertIn("ASIN 今日数据", message)
+        self.assertIn("PARENT1234", message)
+        self.assertIn("大类排名: 4335 (Home & Kitchen)", message)
+        self.assertIn("小类排名: 16 (Milk Frothers)", message)
+        self.assertIn("CHILD00001", message)
+        self.assertIn("价格: 23.99", message)
+        self.assertIn("库存: 7", message)
+
 
 if __name__ == "__main__":
     unittest.main()

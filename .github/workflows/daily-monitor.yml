@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "0 1 * * *"
   workflow_dispatch:
+    inputs:
+      current_report:
+        description: "Send current ASIN data even if nothing changed"
+        required: false
+        default: "false"
   push:
     branches: [main]
     paths:
@@ -33,6 +38,7 @@ jobs:
       SIF_MCP_URL: ${{ secrets.SIF_MCP_URL }}
       MARKETPLACE: ${{ secrets.MARKETPLACE || 'US' }}
       PANGOLIN_ZIPCODE: ${{ secrets.PANGOLIN_ZIPCODE || '10041' }}
+      FORCE_CURRENT_REPORT: ${{ github.event_name == 'push' || github.event.inputs.current_report == 'true' }}
       STATE_BRANCH: monitor-state
       STATE_PATH: state/latest.enc.json
     steps:
