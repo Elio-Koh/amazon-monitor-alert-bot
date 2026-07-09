@@ -136,7 +136,7 @@ class MonitorTest(unittest.TestCase):
 
         message = monitor.format_snapshot_report(snapshot)
 
-        self.assertIn("ASIN 今日数据", message)
+        self.assertIn("ASIN 今日数据｜北京时间 2026-07-09 11:30:00", message)
         self.assertIn("PARENT1234", message)
         self.assertIn("大类排名: 4335 (Home & Kitchen)", message)
         self.assertIn("小类排名: 16 (Milk Frothers)", message)
@@ -177,6 +177,22 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(child["price"], 86.57)
         self.assertEqual(child["coupon"], "")
         self.assertEqual(child["fulfillment_method"], "AMZ")
+
+    def test_normalizes_pangolin_delivery_and_return_badge_aliases(self):
+        child = monitor.normalize_child(
+            "B0FFT34472",
+            {
+                "asin": "B0FFT34472",
+                "price": "$85.53",
+                "deliveryInfo": {"deliveryDate": "Tomorrow, Jul 10"},
+                "productBadges": [{"label": "Frequently returned item"}],
+            },
+            295,
+            "pangolin",
+        )
+
+        self.assertEqual(child["delivery_promise"], "Tomorrow, Jul 10")
+        self.assertTrue(child["frequently_returned"])
 
     def test_extract_child_asins_ignores_numeric_variations_and_invalid_asins(self):
         detail = {
@@ -256,6 +272,51 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(len(parent_children), 15)
         self.assertNotIn("13", parent_children)
         self.assertEqual(snapshot["children"]["B0FVX93K44"]["inventory"], 14)
+
+    def test_collect_snapshot_uses_previous_inventory_when_xingshang_times_out(self):
+        previous = {
+            "parents": {"B0FFT1JQ9T": {"child_asins": ["B0FFT34472", "B0FVX93K44"]}},
+            "children": {
+                "B0FFT34472": {"inventory": 295},
+                "B0FVX93K44": {"inventory": 70},
+            },
+        }
+
+        def fake_fallback(config, asin, marketplace, errors, label):
+            if label == "parent":
+                return {
+                    "asin": asin,
+                    "bsrRank": 274790,
+                    "bsrLabel": "Home & Kitchen",
+                    "rating": 4.5,
+                    "ratings": 59,
+                    "variationList": [{"asin": "B0FFT34472"}],
+                }, "SELLERSPRITE_MCP_URL"
+            return {"asin": asin, "price": 1.0, "coupon": "", "fulfillment": "AMZ"}, "SELLERSPRITE_MCP_URL"
+
+        with (
+            patch("monitor.pangolin_scrape", return_value={"data": {"json": {"data": {"results": []}}}}),
+            patch("monitor.fetch_fallback_detail", side_effect=fake_fallback),
+            patch("monitor.fetch_inventory", side_effect=TimeoutError()),
+        ):
+            snapshot = monitor.collect_snapshot(
+                {
+                    "PANGOLINFO_API_TOKEN": "token",
+                    "MONITOR_PARENT_ASINS": "B0FFT1JQ9T",
+                    "XINGSHANG_MCP_URL_TEMPLATE": "https://example.com/{parent_asin}",
+                    "MARKETPLACE": "US",
+                    "PANGOLIN_ZIPCODE": "10041",
+                    "PANGOLIN_TIMEOUT_SECONDS": "1",
+                    "MCP_TIMEOUT_SECONDS": "1",
+                    "XINGSHANG_TIMEOUT_SECONDS": "30",
+                },
+                previous=previous,
+            )
+
+        self.assertEqual(snapshot["parents"]["B0FFT1JQ9T"]["inventory_source"], "previous_snapshot")
+        self.assertEqual(snapshot["children"]["B0FVX93K44"]["inventory"], 70)
+        self.assertIn("B0FVX93K44", snapshot["parents"]["B0FFT1JQ9T"]["child_asins"])
+        self.assertTrue(any("xingshang failed" in error for error in snapshot["errors"]))
 
     def test_sellersprite_mcp_uses_secret_key_header(self):
         captured = {}

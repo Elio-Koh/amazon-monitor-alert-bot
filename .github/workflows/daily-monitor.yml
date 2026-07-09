@@ -9,10 +9,10 @@ on:
         description: "Send current ASIN data even if nothing changed"
         required: false
         default: "false"
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/daily-monitor.yml"
+      dry_run:
+        description: "Print report to Actions logs without sending Feishu or publishing state"
+        required: false
+        default: "false"
 
 permissions:
   contents: write
@@ -41,9 +41,11 @@ jobs:
       PANGOLIN_ZIPCODE: ${{ secrets.PANGOLIN_ZIPCODE || '10041' }}
       PANGOLIN_TIMEOUT_SECONDS: ${{ secrets.PANGOLIN_TIMEOUT_SECONDS || '8' }}
       MCP_TIMEOUT_SECONDS: ${{ secrets.MCP_TIMEOUT_SECONDS || '20' }}
-      XINGSHANG_TIMEOUT_SECONDS: ${{ secrets.XINGSHANG_TIMEOUT_SECONDS || '30' }}
+      XINGSHANG_TIMEOUT_SECONDS: ${{ secrets.XINGSHANG_TIMEOUT_SECONDS || '90' }}
       XINGSHANG_FORCE_REFRESH: ${{ secrets.XINGSHANG_FORCE_REFRESH || 'false' }}
-      FORCE_CURRENT_REPORT: ${{ github.event_name == 'push' || github.event.inputs.current_report == 'true' }}
+      CURRENT_REPORT: ${{ github.event.inputs.current_report || 'false' }}
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      FORCE_CURRENT_REPORT: ${{ github.event.inputs.current_report == 'true' }}
       STATE_BRANCH: monitor-state
       STATE_PATH: state/latest.enc.json
     steps:
@@ -68,9 +70,19 @@ jobs:
           fi
 
       - name: Run monitor
-        run: python monitor.py --state "$STATE_PATH" --output "$STATE_PATH"
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$CURRENT_REPORT" = "true" ]; then
+            args+=(--report-current)
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python monitor.py --state "$STATE_PATH" --output "$STATE_PATH" "${args[@]}"
 
       - name: Publish state
+        if: env.DRY_RUN != 'true'
         run: |
           set -euo pipefail
           rm -rf /tmp/monitor-state

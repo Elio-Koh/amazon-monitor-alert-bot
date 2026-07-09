@@ -15,7 +15,7 @@ import socket
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from cryptography.fernet import Fernet
@@ -34,6 +34,41 @@ CHILD_FIELDS = (
 )
 SITE_BY_MARKETPLACE = {"US": "amz_us", "CA": "amz_ca", "UK": "amz_uk", "DE": "amz_de", "AU": "amz_au", "MX": "amz_mx"}
 ASIN_PATTERN = re.compile(r"^[A-Z0-9]{10}$")
+BEIJING_TZ = timezone(timedelta(hours=8))
+DELIVERY_KEYS = {
+    "delivery",
+    "deliverydate",
+    "delivery_date",
+    "deliveryinfo",
+    "delivery_info",
+    "deliverypromise",
+    "delivery_promise",
+    "deliverytime",
+    "delivery_time",
+    "estimateddelivery",
+    "estimated_delivery",
+    "fastestdelivery",
+    "fastest_delivery",
+    "arrival",
+    "arrivaldate",
+    "arrival_date",
+    "availability",
+}
+RETURN_BADGE_KEYS = {
+    "frequentlyreturned",
+    "frequently_returned",
+    "frequently_return",
+    "frequentlyreturnedbadge",
+    "highreturnrate",
+    "high_return_rate",
+    "returnratewarning",
+    "return_rate_warning",
+    "returnwarning",
+    "return_warning",
+    "productbadges",
+    "badges",
+    "badge",
+}
 
 
 class MonitorError(RuntimeError):
@@ -44,13 +79,27 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def format_report_time(value: Any) -> str:
+    text = first_text(value)
+    if not text:
+        dt = datetime.now(timezone.utc)
+    else:
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return text
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(BEIJING_TZ).strftime("北京时间 %Y-%m-%d %H:%M:%S")
+
+
 def first_text(value: Any) -> Optional[str]:
     if value is None:
         return None
     if isinstance(value, str):
         return value.strip() or None
     if isinstance(value, Mapping):
-        for key in ("text", "value", "name", "title", "label", "deliveryTime", "fastestDelivery"):
+        for key in ("text", "value", "name", "title", "label", "deliveryTime", "deliveryDate", "fastestDelivery", "estimatedDelivery", "arrivalDate"):
             text = first_text(value.get(key))
             if text:
                 return text
@@ -62,6 +111,30 @@ def first_text(value: Any) -> Optional[str]:
                 return text
         return None
     return str(value).strip() or None
+
+
+def first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def find_nested_value(value: Any, keys: set[str]) -> Any:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if str(key).replace("-", "_").lower() in keys:
+                return child
+        for child in value.values():
+            found = find_nested_value(child, keys)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = find_nested_value(child, keys)
+            if found is not None:
+                return found
+    return None
 
 
 def listify(value: Any) -> List[Any]:
@@ -112,6 +185,8 @@ def parse_bool(value: Any) -> Optional[bool]:
         return True
     if lower in {"false", "no", "n", "0", "off"}:
         return False
+    if any(phrase in lower for phrase in ("frequently returned", "high return", "highly returned")):
+        return True
     return None
 
 
@@ -169,7 +244,7 @@ def extract_child_asins(detail: Mapping[str, Any]) -> List[str]:
 
 def normalize_delivery(value: Any) -> Optional[str]:
     if isinstance(value, Mapping):
-        delivery = first_text(value.get("deliveryTime") or value.get("delivery"))
+        delivery = first_text(value.get("deliveryTime") or value.get("deliveryDate") or value.get("delivery") or value.get("estimatedDelivery") or value.get("arrivalDate"))
         fastest = first_text(value.get("fastestDelivery"))
         if delivery and fastest:
             return f"{delivery}; fastest {fastest}"
@@ -225,17 +300,27 @@ def normalize_child(child_asin: str, detail: Mapping[str, Any], inventory: Optio
     has_detail = any(key != "asin" for key in detail)
     coupon = first_text(detail.get("coupon") or detail.get("couponInfo") or detail.get("couponText"))
     promotion = first_text(detail.get("promotion") or detail.get("deal") or detail.get("badge") or detail.get("badges"))
+    return_badge = first_present(
+        detail.get("frequentlyReturned"),
+        detail.get("frequently_returned"),
+        detail.get("frequently_return"),
+        badge.get("frequentlyReturned"),
+        find_nested_value(detail, RETURN_BADGE_KEYS),
+    )
+    delivery = first_present(
+        detail.get("deliveryTime"),
+        detail.get("delivery"),
+        detail.get("deliveryPromise"),
+        detail.get("delivery_promise"),
+        detail.get("availability"),
+        find_nested_value(detail, DELIVERY_KEYS),
+    )
     return {
         "asin": child_asin.upper(),
         "price": parse_float(detail.get("price") or detail.get("finalPrice") or detail.get("price_display")),
         "coupon": coupon if coupon is not None else ("" if has_detail else None),
         "promotion": promotion if promotion is not None else ("" if has_detail else None),
-        "frequently_returned": parse_bool(
-            detail.get("frequentlyReturned")
-            or detail.get("frequently_returned")
-            or detail.get("frequently_return")
-            or badge.get("frequentlyReturned")
-        ),
+        "frequently_returned": parse_bool(return_badge),
         "inventory": inventory,
         "fulfillment_method": first_text(
             detail.get("fulfillment")
@@ -243,13 +328,7 @@ def normalize_child(child_asin: str, detail: Mapping[str, Any], inventory: Optio
             or detail.get("fulfillment_method")
             or detail.get("seller")
         ),
-        "delivery_promise": normalize_delivery(
-            detail.get("deliveryTime")
-            or detail.get("delivery")
-            or detail.get("deliveryPromise")
-            or detail.get("delivery_promise")
-            or detail.get("availability")
-        ),
+        "delivery_promise": normalize_delivery(delivery),
         "source": source,
     }
 
@@ -276,6 +355,25 @@ def merge_child_asins(parent: Mapping[str, Any], children: Sequence[Mapping[str,
         if asin in inventories:
             row["inventory"] = inventories[asin]
     return dict(sorted(merged.items()))
+
+
+def previous_inventory_payload(previous: Optional[Mapping[str, Any]], parent_asin: str) -> Dict[str, Any]:
+    if not isinstance(previous, Mapping):
+        return {}
+    parents = previous.get("parents", {}) if isinstance(previous.get("parents"), Mapping) else {}
+    children = previous.get("children", {}) if isinstance(previous.get("children"), Mapping) else {}
+    parent = parents.get(parent_asin.upper(), {}) if isinstance(parents.get(parent_asin.upper(), {}), Mapping) else {}
+    child_asins = set(str(asin).upper() for asin in parent.get("child_asins") or [])
+    child_asins.update(str(asin).upper() for asin in children)
+    items = []
+    for asin in sorted(child_asins):
+        if not is_asin(asin):
+            continue
+        row = children.get(asin, {})
+        if not isinstance(row, Mapping) or row.get("inventory") is None:
+            continue
+        items.append({"asin": asin, "inventory": row.get("inventory")})
+    return {"items": items} if items else {}
 
 
 def _json_body(payload: Mapping[str, Any]) -> bytes:
@@ -452,7 +550,7 @@ def describe_exception(exc: BaseException, *, timeout: Optional[int] = None) -> 
     return f"{type(exc).__name__}{suffix}: {message}" if message else f"{type(exc).__name__}{suffix}"
 
 
-def collect_snapshot(config: Mapping[str, str]) -> Dict[str, Any]:
+def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     site = SITE_BY_MARKETPLACE.get(config.get("MARKETPLACE", "US").upper(), "amz_us")
     marketplace = config.get("MARKETPLACE", "US").upper()
     pangolin_timeout = config_int(config, "PANGOLIN_TIMEOUT_SECONDS", 8)
@@ -498,8 +596,12 @@ def collect_snapshot(config: Mapping[str, str]) -> Dict[str, Any]:
             if inventory_payload:
                 parent["inventory_source"] = "xingshang"
         except Exception as exc:
-            inventory_payload = {}
-            snapshot["errors"].append(f"{parent_asin}: xingshang failed: {describe_exception(exc, timeout=xingshang_timeout)}")
+            error = f"{parent_asin}: xingshang failed: {describe_exception(exc, timeout=xingshang_timeout)}"
+            inventory_payload = previous_inventory_payload(previous, parent_asin)
+            if inventory_payload:
+                parent["inventory_source"] = "previous_snapshot"
+                snapshot["warnings"].append(f"{parent_asin}: xingshang failed; using previous inventory snapshot")
+            snapshot["errors"].append(error)
         child_asins = sorted(set(parent["child_asins"]) | set(inventory_by_asin(inventory_payload)))
         child_rows = []
         prefer_fallback_for_children = parent_pangolin_empty and parent_source != "pangolin"
@@ -664,13 +766,18 @@ def format_source(value: Any) -> str:
         return "Pangolinfo"
     if text == "xingshang_inventory_only":
         return "xingshang 库存"
+    if text == "previous_snapshot":
+        return "上次快照"
     return text or "未知"
 
 
 def report_status(snapshot: Mapping[str, Any]) -> str:
     parents = snapshot.get("parents", {}) if isinstance(snapshot.get("parents"), Mapping) else {}
     children = snapshot.get("children", {}) if isinstance(snapshot.get("children"), Mapping) else {}
-    if snapshot.get("errors"):
+    errors = [str(error) for error in snapshot.get("errors") or []]
+    if errors:
+        if all("xingshang failed" in error for error in errors) and any(isinstance(parent, Mapping) and parent.get("inventory_source") == "previous_snapshot" for parent in parents.values()):
+            return "部分数据：库存沿用上次快照"
         return "部分数据：数据源异常"
     if any(not has_front_detail(row) for row in list(parents.values()) + list(children.values())):
         return "部分数据：前台数据缺失"
@@ -702,12 +809,15 @@ def format_source_summary(snapshot: Mapping[str, Any], parent: Mapping[str, Any]
     inventory = format_source(parent.get("inventory_source")) if parent.get("inventory_source") else "未覆盖"
     parts = [f"前台 {front}", f"库存 {inventory}"]
     if snapshot.get("warnings"):
-        parts.append("Pangolinfo 空结果已补源")
+        if any("pangolin" in str(warning).lower() for warning in snapshot.get("warnings") or []):
+            parts.append("Pangolinfo 空结果已补源")
+        if parent.get("inventory_source") == "previous_snapshot":
+            parts.append("xingshang 异常，库存沿用上次快照")
     return "；".join(parts)
 
 
 def format_snapshot_report(snapshot: Mapping[str, Any]) -> str:
-    lines = [f"ASIN 今日数据｜{snapshot.get('captured_at') or now_iso()}", f"状态：{report_status(snapshot)}"]
+    lines = [f"ASIN 今日数据｜{format_report_time(snapshot.get('captured_at') or now_iso())}", f"状态：{report_status(snapshot)}"]
     parents = snapshot.get("parents", {}) if isinstance(snapshot.get("parents"), Mapping) else {}
     children = snapshot.get("children", {}) if isinstance(snapshot.get("children"), Mapping) else {}
     for parent_asin in sorted(parents):
@@ -779,7 +889,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     config = env_config()
     previous = load_previous(args.state, config["STATE_ENCRYPTION_KEY"])
-    current = collect_snapshot(config)
+    current = collect_snapshot(config, previous=previous)
     changes = diff_snapshots(previous, current)
     if args.report_current or config.get("FORCE_CURRENT_REPORT", "").lower() == "true":
         message = format_snapshot_report(current)
