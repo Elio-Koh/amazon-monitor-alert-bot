@@ -194,6 +194,10 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(child["delivery_promise"], "Tomorrow, Jul 10")
         self.assertTrue(child["frequently_returned"])
 
+    def test_pangolin_error_response_is_not_treated_as_empty(self):
+        with self.assertRaisesRegex(monitor.MonitorError, "账户已过期"):
+            monitor.extract_results({"code": 2007, "message": "账户已过期", "data": None})
+
     def test_extract_child_asins_ignores_numeric_variations_and_invalid_asins(self):
         detail = {
             "variationList": [{"asin": "B0FFT34472"}],
@@ -215,7 +219,7 @@ class MonitorTest(unittest.TestCase):
         with patch("monitor.call_mcp_tool", side_effect=fake_call):
             monitor.fetch_inventory("B0FFT1JQ9T", "https://example.com/xingshang_config_{parent_asin}", timeout=1)
 
-        self.assertEqual(captured["server_url"], "https://example.com/xingshang_config_B0FFT1JQ9T")
+        self.assertEqual(captured["server_url"], "https://example.com/xingshang_config_B0FFT1JQ9T/")
         self.assertEqual(captured["fragments"], ("get_store_asin_info",))
         self.assertEqual(captured["args"]["force_refresh"], False)
 

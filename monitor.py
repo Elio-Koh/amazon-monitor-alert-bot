@@ -415,6 +415,9 @@ def pangolin_scrape(api_token: str, parser_name: str, content: str, *, site: str
 
 
 def extract_results(response: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    code = response.get("code")
+    if code not in {None, 0, "0", 200, "200", "OK", "ok"} and response.get("data") is None:
+        raise MonitorError(f"pangolin response {code}: {first_text(response.get('message')) or 'unknown error'}")
     data = response.get("data")
     if not isinstance(data, Mapping):
         return []
@@ -450,7 +453,7 @@ async def call_mcp_tool(server_url: str, name_fragments: Iterable[str], args: Ma
     fragments = [fragment.lower() for fragment in name_fragments]
 
     async def call_with_streamable() -> Any:
-        async with httpx.AsyncClient(headers=dict(headers or {})) as client:
+        async with httpx.AsyncClient(headers=dict(headers or {}), follow_redirects=True) as client:
             async with streamable_http_client(server_url, http_client=client) as streams:
                 read_stream, write_stream = streams[0], streams[1]
                 async with ClientSession(read_stream, write_stream) as session:
@@ -499,6 +502,8 @@ def fetch_inventory(parent_asin: str, url_template: str, timeout: int = 30, forc
     if not url_template:
         return {}
     server_url = url_template.format(parent_asin=parent_asin.upper(), PARENT_ASIN=parent_asin.upper())
+    if not server_url.endswith("/"):
+        server_url += "/"
     return run_mcp(call_mcp_tool(server_url, ("get_store_asin_info",), {"spu_item_id_list": [parent_asin.upper()], "force_refresh": force_refresh}), timeout)
 
 
