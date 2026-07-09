@@ -192,6 +192,21 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(child["coupon"], "")
         self.assertEqual(child["fulfillment_method"], "AMZ")
 
+    def test_normalizes_pangolin_rating_count_parenthesized_rating(self):
+        parent = monitor.normalize_parent(
+            "B0FFT1JQ9T",
+            {"asin": "B0FFT1JQ9T", "star": "4.4", "rating": "(61)"},
+            "pangolin",
+        )
+
+        self.assertEqual(parent["stars"], 4.4)
+        self.assertEqual(parent["rating_count"], 61)
+
+    def test_extract_child_asins_reads_pangolin_variant_details(self):
+        detail = {"variantDetails": [{"asin": "B0FFT34472"}, {"asin": "B0FFT2BF9L"}]}
+
+        self.assertEqual(monitor.extract_child_asins(detail), ["B0FFT2BF9L", "B0FFT34472"])
+
     def test_normalizes_pangolin_delivery_and_return_badge_aliases(self):
         child = monitor.normalize_child(
             "B0FFT34472",
@@ -207,6 +222,16 @@ class MonitorTest(unittest.TestCase):
 
         self.assertEqual(child["delivery_promise"], "Tomorrow, Jul 10")
         self.assertTrue(child["frequently_returned"])
+
+    def test_normalizes_absent_return_badge_on_valid_pangolin_page_as_false(self):
+        child = monitor.normalize_child(
+            "B0FFT34472",
+            {"asin": "B0FFT34472", "title": "Kids table", "price": "$85.53", "delivery": {"deliveryTime": "Tomorrow"}},
+            None,
+            "pangolin",
+        )
+
+        self.assertFalse(child["frequently_returned"])
 
     def test_normalizes_deal_without_treating_amazon_choice_as_promotion(self):
         deal = monitor.normalize_child("B0FFT34472", {"promotions": ["Limited time deal"]}, None, "pangolin")
@@ -249,7 +274,7 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(captured["fragments"], ("get_store_asin_info",))
         self.assertEqual(captured["args"]["force_refresh"], False)
 
-    def test_collect_snapshot_merges_inventory_children_without_fake_numeric_asin(self):
+    def test_collect_snapshot_separates_inventory_only_asins_from_live_children(self):
         seller_children = [
             "B0FFT34472",
             "B0FFT2BF9L",
@@ -298,10 +323,14 @@ class MonitorTest(unittest.TestCase):
                 }
             )
 
-        parent_children = snapshot["parents"]["B0FFT1JQ9T"]["child_asins"]
-        self.assertEqual(len(parent_children), 15)
+        parent = snapshot["parents"]["B0FFT1JQ9T"]
+        parent_children = parent["child_asins"]
+        self.assertEqual(len(parent_children), 13)
         self.assertNotIn("13", parent_children)
+        self.assertEqual(parent["inventory_only_asins"], ["B0FVX6PTYC", "B0FVX93K44"])
+        self.assertIn("B0FVX93K44", parent["front_unavailable_asins"])
         self.assertEqual(snapshot["children"]["B0FVX93K44"]["inventory"], 14)
+        self.assertEqual(snapshot["children"]["B0FVX93K44"]["front_status"], "不可售/404")
 
     def test_collect_snapshot_uses_previous_inventory_when_xingshang_times_out(self):
         previous = {
@@ -345,8 +374,28 @@ class MonitorTest(unittest.TestCase):
 
         self.assertEqual(snapshot["parents"]["B0FFT1JQ9T"]["inventory_source"], "previous_snapshot")
         self.assertEqual(snapshot["children"]["B0FVX93K44"]["inventory"], 70)
-        self.assertIn("B0FVX93K44", snapshot["parents"]["B0FFT1JQ9T"]["child_asins"])
+        self.assertNotIn("B0FVX93K44", snapshot["parents"]["B0FFT1JQ9T"]["child_asins"])
+        self.assertIn("B0FVX93K44", snapshot["parents"]["B0FFT1JQ9T"]["inventory_only_asins"])
         self.assertTrue(any("xingshang failed" in error for error in snapshot["errors"]))
+
+    def test_inventory_only_positive_stock_triggers_change_alert(self):
+        previous = {
+            "parents": {"B0FFT1JQ9T": {"child_asins": ["B0FFT34472"], "inventory_only_asins": []}},
+            "children": {"B0FFT34472": {"inventory": 295}},
+            "errors": [],
+        }
+        current = {
+            "parents": {"B0FFT1JQ9T": {"child_asins": ["B0FFT34472"], "inventory_only_asins": ["B0FVX93K44"]}},
+            "children": {"B0FFT34472": {"inventory": 295}, "B0FVX93K44": {"inventory": 70, "front_status": "不可售/404"}},
+            "errors": [],
+        }
+
+        changes = monitor.diff_snapshots(previous, current)
+        message = monitor.format_message(changes, captured_at="2026-07-10T01:00:12Z")
+
+        self.assertIn("B0FFT1JQ9T inventory-only child added: B0FVX93K44", changes)
+        self.assertIn("库存侧异常：", message)
+        self.assertIn("新增库存侧异常：B0FFT1JQ9T / B0FVX93K44", message)
 
     def test_collect_snapshot_supplements_partial_pangolin_child_from_fallback(self):
         def fake_pangolin(token, parser_name, content, *, site, zipcode, timeout):
@@ -420,7 +469,7 @@ class MonitorTest(unittest.TestCase):
         self.assertNotIn("frequently return: False", message)
 
     def test_formats_compact_report_without_internal_source_noise(self):
-        child_asins = ["B0FFT34472", "B0FVX93K44"]
+        child_asins = ["B0FFT34472"]
         snapshot = {
             "captured_at": "2026-07-09T03:52:28Z",
             "parents": {
@@ -432,13 +481,15 @@ class MonitorTest(unittest.TestCase):
                     "stars": 4.5,
                     "rating_count": 59,
                     "child_asins": child_asins,
+                    "inventory_only_asins": ["B0FVX93K44"],
+                    "front_unavailable_asins": ["B0FVX93K44"],
                     "source": "SELLERSPRITE_MCP_URL",
                     "inventory_source": "xingshang",
                 }
             },
             "children": {
                 "B0FFT34472": {"price": 85.53, "coupon": "", "promotion": "7-Day Deal", "inventory": 295, "fulfillment_method": "AMZ", "source": "SELLERSPRITE_MCP_URL"},
-                "B0FVX93K44": {"price": 89.99, "coupon": "", "inventory": 70, "fulfillment_method": "AMZ", "source": "SELLERSPRITE_MCP_URL"},
+                "B0FVX93K44": {"inventory": 70, "front_status": "不可售/404", "source": "xingshang_inventory_only"},
             },
             "warnings": [
                 "B0FFT1JQ9T: pangolin parent empty; using SELLERSPRITE_MCP_URL",
@@ -450,8 +501,10 @@ class MonitorTest(unittest.TestCase):
         message = monitor.format_snapshot_report(snapshot)
 
         self.assertIn("状态：完整数据（SellerSprite 补源）", message)
-        self.assertIn("子体：2", message)
+        self.assertIn("子体：1", message)
         self.assertIn("B0FFT34472｜价 85.53｜库存 295｜Coupon 无｜促销 7-Day Deal｜配送 AMZ｜退货 未覆盖｜时效 未覆盖", message)
+        self.assertIn("库存侧异常：", message)
+        self.assertIn("B0FVX93K44｜库存 70｜前台状态 不可售/404｜来源 xingshang", message)
         self.assertIn("数据源：前台 SellerSprite；库存 xingshang；Pangolinfo 空结果已补源", message)
         self.assertNotIn("SELLERSPRITE_MCP_URL", message)
         self.assertNotIn("pangolin child empty", message)

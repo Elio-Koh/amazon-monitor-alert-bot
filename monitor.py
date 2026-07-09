@@ -69,6 +69,13 @@ RETURN_BADGE_KEYS = {
     "badges",
     "badge",
 }
+RETURN_BADGE_TEXT_PATTERNS = (
+    "frequently returned item",
+    "frequently returned",
+    "high return",
+    "highly returned",
+    "return warning",
+)
 
 
 class MonitorError(RuntimeError):
@@ -135,6 +142,17 @@ def find_nested_value(value: Any, keys: set[str]) -> Any:
             if found is not None:
                 return found
     return None
+
+
+def contains_text(value: Any, patterns: Sequence[str]) -> bool:
+    if isinstance(value, str):
+        lower = value.lower()
+        return any(pattern in lower for pattern in patterns)
+    if isinstance(value, Mapping):
+        return any(contains_text(child, patterns) for child in value.values())
+    if isinstance(value, list):
+        return any(contains_text(child, patterns) for child in value)
+    return False
 
 
 def listify(value: Any) -> List[Any]:
@@ -231,6 +249,7 @@ def extract_child_asins(detail: Mapping[str, Any]) -> List[str]:
         detail.get("variationAsins"),
         detail.get("childAsins"),
         detail.get("children"),
+        detail.get("variantDetails"),
     ]
     if isinstance(detail.get("variations"), list):
         candidates.append(detail.get("variations"))
@@ -250,6 +269,28 @@ def normalize_delivery(value: Any) -> Optional[str]:
             return f"{delivery}; fastest {fastest}"
         return delivery or fastest
     return first_text(value)
+
+
+def front_detail_is_valid(detail: Mapping[str, Any], requested_asin: Optional[str] = None) -> bool:
+    if not detail:
+        return False
+    asin = first_text(detail.get("asin"))
+    if asin is not None:
+        if not is_asin(asin):
+            return False
+        if requested_asin and asin.upper() != requested_asin.upper():
+            return False
+    return bool(
+        parse_float(detail.get("price") or detail.get("finalPrice") or detail.get("price_display")) is not None
+        or first_text(detail.get("title"))
+        or normalize_delivery(
+            detail.get("delivery")
+            or detail.get("deliveryTime")
+            or detail.get("deliveryPromise")
+            or find_nested_value(detail, DELIVERY_KEYS)
+        )
+        or first_text(detail.get("seller"))
+    )
 
 
 def normalize_promotion(detail: Mapping[str, Any]) -> Optional[str]:
@@ -299,6 +340,8 @@ def normalize_parent(parent_asin: str, detail: Mapping[str, Any], source: str) -
     rating_text = first_text(detail.get("rating"))
     if rating_count_source is None and rating_text and "rating" in rating_text.lower():
         rating_count_source = rating_text
+    if rating_count_source is None and detail.get("star") is not None:
+        rating_count_source = rating_text
     return {
         "asin": parent_asin.upper(),
         "major_rank": rank_items[0]["rank"] if rank_items else parse_int(detail.get("bsrRank")),
@@ -332,12 +375,17 @@ def normalize_child(child_asin: str, detail: Mapping[str, Any], inventory: Optio
         detail.get("availability"),
         find_nested_value(detail, DELIVERY_KEYS),
     )
+    frequently_returned = parse_bool(return_badge)
+    if frequently_returned is None and contains_text(detail, RETURN_BADGE_TEXT_PATTERNS):
+        frequently_returned = True
+    if frequently_returned is None and str(source).startswith("pangolin") and front_detail_is_valid(detail, child_asin):
+        frequently_returned = False
     return {
         "asin": child_asin.upper(),
         "price": parse_float(detail.get("price") or detail.get("finalPrice") or detail.get("price_display")),
         "coupon": coupon if coupon is not None else ("" if has_detail else None),
         "promotion": promotion if promotion is not None else ("" if has_detail else None),
-        "frequently_returned": parse_bool(return_badge),
+        "frequently_returned": frequently_returned,
         "inventory": inventory,
         "fulfillment_method": first_text(
             detail.get("fulfillment")
@@ -384,7 +432,6 @@ def merge_child_asins(parent: Mapping[str, Any], children: Sequence[Mapping[str,
     inventories = inventory_by_asin(inventory_payload)
     child_asins = set(str(asin).upper() for asin in parent.get("child_asins") or [])
     child_asins.update(str(row.get("asin", "")).upper() for row in children if row.get("asin"))
-    child_asins.update(inventories)
     merged = {str(row.get("asin")).upper(): dict(row) for row in children if row.get("asin")}
     for asin in sorted(child_asins):
         row = merged.setdefault(asin, {"asin": asin})
@@ -648,7 +695,10 @@ def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, 
                 parent["inventory_source"] = "previous_snapshot"
                 snapshot["warnings"].append(f"{parent_asin}: xingshang failed; using previous inventory snapshot")
             snapshot["errors"].append(error)
-        child_asins = sorted(set(parent["child_asins"]) | set(inventory_by_asin(inventory_payload)))
+        inventories = inventory_by_asin(inventory_payload)
+        child_asins = sorted(set(parent["child_asins"]))
+        inventory_only_asins = sorted(set(inventories) - set(child_asins))
+        front_unavailable_asins: List[str] = []
         child_rows = []
         prefer_fallback_for_children = parent_pangolin_empty and parent_source != "pangolin"
         for child_asin in child_asins:
@@ -683,10 +733,41 @@ def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, 
                     child_source = f"pangolin+{fallback_source}"
             if not detail:
                 child_source = "xingshang_inventory_only"
+                front_unavailable_asins.append(child_asin)
                 snapshot["errors"].append(f"{child_asin}: 前台数据缺失")
             child_rows.append(normalize_child(child_asin, {**detail, "asin": child_asin}, inventory_by_asin(inventory_payload).get(child_asin), child_source))
+        for child_asin in inventory_only_asins:
+            front_status = "不在前台变体列表"
+            try:
+                rows = extract_results(
+                    pangolin_scrape(
+                        config["PANGOLINFO_API_TOKEN"],
+                        "amzProductDetail",
+                        child_asin,
+                        site=site,
+                        zipcode=config.get("PANGOLIN_ZIPCODE", "10041"),
+                        timeout=pangolin_timeout,
+                    )
+                )
+                detail = rows[0] if rows else {}
+                if not front_detail_is_valid(detail, child_asin):
+                    front_status = "不可售/404"
+                    front_unavailable_asins.append(child_asin)
+            except Exception as exc:
+                front_status = "前台状态未知"
+                snapshot["warnings"].append(f"{child_asin}: inventory-only front check failed: {describe_exception(exc, timeout=pangolin_timeout)}")
+            child_rows.append(
+                {
+                    "asin": child_asin,
+                    "inventory": inventories.get(child_asin),
+                    "front_status": front_status,
+                    "source": "xingshang_inventory_only",
+                }
+            )
         children = merge_child_asins(parent, child_rows, inventory_payload)
-        parent["child_asins"] = sorted(children)
+        parent["child_asins"] = child_asins
+        parent["inventory_only_asins"] = inventory_only_asins
+        parent["front_unavailable_asins"] = sorted(set(front_unavailable_asins))
         snapshot["parents"][parent_asin] = parent
         snapshot["children"].update(children)
     return snapshot
@@ -698,20 +779,28 @@ def diff_snapshots(previous: Optional[Mapping[str, Any]], current: Mapping[str, 
     changes: List[str] = []
     prev_parents = previous.get("parents", {}) if isinstance(previous.get("parents"), Mapping) else {}
     cur_parents = current.get("parents", {}) if isinstance(current.get("parents"), Mapping) else {}
+    prev_children = previous.get("children", {}) if isinstance(previous.get("children"), Mapping) else {}
+    cur_children = current.get("children", {}) if isinstance(current.get("children"), Mapping) else {}
     for asin in sorted(set(prev_parents) | set(cur_parents)):
         prev = prev_parents.get(asin, {})
         cur = cur_parents.get(asin, {})
         for field in PARENT_FIELDS:
             if prev.get(field) != cur.get(field):
                 changes.append(f"{asin} parent {field}: {prev.get(field)} -> {cur.get(field)}")
-        prev_children = set(prev.get("child_asins") or [])
-        cur_children = set(cur.get("child_asins") or [])
-        for child_asin in sorted(cur_children - prev_children):
+        prev_live_children = set(prev.get("child_asins") or [])
+        cur_live_children = set(cur.get("child_asins") or [])
+        for child_asin in sorted(cur_live_children - prev_live_children):
             changes.append(f"{asin} child added: {child_asin}")
-        for child_asin in sorted(prev_children - cur_children):
+        for child_asin in sorted(prev_live_children - cur_live_children):
             changes.append(f"{asin} child removed: {child_asin}")
-    prev_children = previous.get("children", {}) if isinstance(previous.get("children"), Mapping) else {}
-    cur_children = current.get("children", {}) if isinstance(current.get("children"), Mapping) else {}
+        prev_inventory_only = set(prev.get("inventory_only_asins") or [])
+        cur_inventory_only = set(cur.get("inventory_only_asins") or [])
+        for child_asin in sorted(cur_inventory_only - prev_inventory_only):
+            if parse_int((cur_children.get(child_asin) or {}).get("inventory")):
+                changes.append(f"{asin} inventory-only child added: {child_asin}")
+        for child_asin in sorted(prev_inventory_only - cur_inventory_only):
+            if parse_int((prev_children.get(child_asin) or {}).get("inventory")):
+                changes.append(f"{asin} inventory-only child removed: {child_asin}")
     for asin in sorted(set(prev_children) & set(cur_children)):
         prev = prev_children.get(asin, {})
         cur = cur_children.get(asin, {})
@@ -812,6 +901,7 @@ def format_message(changes: Sequence[str], *, baseline: bool = False, captured_a
     parents: Dict[str, List[str]] = {}
     children: Dict[str, List[str]] = {}
     membership: List[str] = []
+    inventory_only: List[str] = []
     errors: List[str] = []
     for raw in changes:
         line = str(raw)
@@ -831,6 +921,12 @@ def format_message(changes: Sequence[str], *, baseline: bool = False, captured_a
             label = "新增" if action == "added" else "解绑"
             membership.append(f"- {label}：{parent_asin} / {child_asin}")
             continue
+        match = re.fullmatch(r"([A-Z0-9]{10}) inventory-only child (added|removed): ([A-Z0-9]{10})", line)
+        if match:
+            parent_asin, action, child_asin = match.groups()
+            label = "新增库存侧异常" if action == "added" else "移除库存侧异常"
+            inventory_only.append(f"- {label}：{parent_asin} / {child_asin}")
+            continue
         errors.append(line)
     lines = [f"ASIN 变化提醒｜{format_report_time(captured_at or now_iso())}", f"状态：发现 {len(changes)} 项变化"]
     if parents:
@@ -845,6 +941,9 @@ def format_message(changes: Sequence[str], *, baseline: bool = False, captured_a
     if membership:
         lines.extend(["", "子体关系："])
         lines.extend(membership)
+    if inventory_only:
+        lines.extend(["", "库存侧异常："])
+        lines.extend(inventory_only)
     if errors:
         lines.extend(["", "数据源异常："])
         lines.extend(f"- {line}" for line in errors[:20])
@@ -893,7 +992,11 @@ def report_status(snapshot: Mapping[str, Any]) -> str:
         if all("xingshang failed" in error for error in errors) and any(isinstance(parent, Mapping) and parent.get("inventory_source") == "previous_snapshot" for parent in parents.values()):
             return "部分数据：库存沿用上次快照"
         return "部分数据：数据源异常"
-    if any(not has_front_detail(row) for row in list(parents.values()) + list(children.values())):
+    live_children = []
+    for parent in parents.values():
+        if isinstance(parent, Mapping):
+            live_children.extend(children.get(str(asin), {}) for asin in parent.get("child_asins") or [])
+    if any(not has_front_detail(row) for row in list(parents.values()) + live_children):
         return "部分数据：前台数据缺失"
     if snapshot.get("warnings"):
         return "完整数据（SellerSprite 补源）"
@@ -961,6 +1064,18 @@ def format_snapshot_report(snapshot: Mapping[str, Any]) -> str:
                 f"退货 {format_coverage(child.get('frequently_returned'), child)}｜"
                 f"时效 {format_coverage(child.get('delivery_promise'), child)}"
             )
+        inventory_only_asins = [str(asin) for asin in parent.get("inventory_only_asins") or []]
+        if inventory_only_asins:
+            lines.append("")
+            lines.append("库存侧异常：")
+            for child_asin in sorted(inventory_only_asins):
+                child = children.get(child_asin, {})
+                lines.append(
+                    f"- {child_asin}｜"
+                    f"库存 {format_value(child.get('inventory'))}｜"
+                    f"前台状态 {format_value(child.get('front_status'))}｜"
+                    f"来源 xingshang"
+                )
         lines.append("")
         lines.append(f"数据源：{format_source_summary(snapshot, parent)}")
     errors = snapshot.get("errors") or []
