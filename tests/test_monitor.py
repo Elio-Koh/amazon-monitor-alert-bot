@@ -506,7 +506,7 @@ class MonitorTest(unittest.TestCase):
 
         self.assertEqual(monitor.extract_child_asins(detail), ["B0FFT2BF9L", "B0FFT34472"])
 
-    def test_fetch_inventory_defaults_to_non_force_refresh(self):
+    def test_fetch_inventory_uses_configured_scope_without_overriding_child_asins(self):
         captured = {}
 
         async def fake_call(server_url, fragments, args, headers=None):
@@ -521,6 +521,7 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(captured["server_url"], "https://example.com/xingshang_config_B0FFT1JQ9T/")
         self.assertEqual(captured["fragments"], ("get_store_asin_info",))
         self.assertEqual(captured["args"]["force_refresh"], False)
+        self.assertNotIn("spu_item_id_list", captured["args"])
 
     def test_collect_snapshot_separates_inventory_only_asins_from_live_children(self):
         seller_children = [

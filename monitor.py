@@ -678,7 +678,7 @@ def fetch_inventory(parent_asin: str, url_template: str, timeout: int = 30, forc
     server_url = url_template.format(parent_asin=parent_asin.upper(), PARENT_ASIN=parent_asin.upper())
     if not server_url.endswith("/"):
         server_url += "/"
-    return run_mcp(call_mcp_tool(server_url, ("get_store_asin_info",), {"spu_item_id_list": [parent_asin.upper()], "force_refresh": force_refresh}), timeout)
+    return run_mcp(call_mcp_tool(server_url, ("get_store_asin_info",), {"force_refresh": force_refresh}), timeout)
 
 
 def fetch_optional_detail_from_mcp(
