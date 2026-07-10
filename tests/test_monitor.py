@@ -86,20 +86,98 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("PARENT1234 child removed: OLDCHILD01", lines)
         self.assertIn("CHILD00001 child price: 10.0 -> 11.0", lines)
         self.assertIn("CHILD00001 child inventory: 3 -> 0", lines)
-        self.assertIn("CHILD00001 child promotion: None -> 7-Day Deal", lines)
+        self.assertNotIn("CHILD00001 child promotion: None -> 7-Day Deal", lines)
         self.assertIn("PARENT1234: xingshang failed", lines)
 
         message = monitor.format_message(changes, captured_at="2026-07-10T01:00:12Z")
 
         self.assertIn("ASIN 变化提醒｜北京时间 2026-07-10 09:00:12", message)
-        self.assertIn("状态：发现 9 项变化", message)
+        self.assertIn("状态：发现 8 项变化", message)
         self.assertIn("父 ASIN PARENT1234", message)
         self.assertIn("大类排名：5 → 7", message)
         self.assertIn("评论数：100 → 101", message)
         self.assertIn("1. CHILD00001", message)
         self.assertIn("价格：10.0 → 11.0", message)
-        self.assertIn("促销/Deal：未知 → 7-Day Deal", message)
+        self.assertNotIn("促销/Deal：未知 → 7-Day Deal", message)
         self.assertIn("数据源异常：", message)
+
+    def test_diff_ignores_unknown_to_known_field_values(self):
+        previous = {
+            "parents": {
+                "PARENT1234": {
+                    "major_rank": None,
+                    "minor_rank": None,
+                    "stars": None,
+                    "rating_count": None,
+                    "child_asins": ["CHILD00001"],
+                }
+            },
+            "children": {"CHILD00001": {"price": None, "inventory": None, "coupon": None, "promotion": None}},
+            "errors": [],
+        }
+        current = {
+            "parents": {
+                "PARENT1234": {
+                    "major_rank": 100,
+                    "minor_rank": 5,
+                    "stars": 4.5,
+                    "rating_count": 61,
+                    "child_asins": ["CHILD00001"],
+                }
+            },
+            "children": {"CHILD00001": {"price": 23.99, "inventory": 7, "coupon": "10% coupon", "promotion": "Deal"}},
+            "errors": [],
+        }
+
+        self.assertEqual(monitor.diff_snapshots(previous, current), [])
+
+    def test_merge_snapshot_preserves_unknown_current_fields_and_keeps_real_empty_values(self):
+        previous = {
+            "captured_at": "2026-07-09T01:15:00Z",
+            "parents": {
+                "PARENT1234": {
+                    "major_rank": 10,
+                    "major_category": "Home",
+                    "minor_rank": 2,
+                    "stars": 4.4,
+                    "rating_count": 20,
+                    "child_asins": ["CHILD00001"],
+                }
+            },
+            "children": {
+                "CHILD00001": {"price": 20.0, "coupon": "10% coupon", "promotion": "Deal", "inventory": 7, "delivery_promise": "2 days"}
+            },
+            "errors": [],
+        }
+        current = {
+            "captured_at": "2026-07-10T01:15:00Z",
+            "parents": {
+                "PARENT1234": {
+                    "major_rank": None,
+                    "major_category": None,
+                    "minor_rank": 3,
+                    "stars": 4.5,
+                    "rating_count": 21,
+                    "child_asins": ["CHILD00001"],
+                }
+            },
+            "children": {
+                "CHILD00001": {"price": None, "coupon": "", "promotion": None, "inventory": 9, "delivery_promise": "3 days"}
+            },
+            "errors": ["PARENT1234: xingshang failed"],
+        }
+
+        merged = monitor.merge_snapshot(previous, current)
+
+        self.assertEqual(merged["captured_at"], "2026-07-10T01:15:00Z")
+        self.assertEqual(merged["parents"]["PARENT1234"]["major_rank"], 10)
+        self.assertEqual(merged["parents"]["PARENT1234"]["major_category"], "Home")
+        self.assertEqual(merged["parents"]["PARENT1234"]["minor_rank"], 3)
+        self.assertEqual(merged["parents"]["PARENT1234"]["stars"], 4.5)
+        self.assertEqual(merged["children"]["CHILD00001"]["price"], 20.0)
+        self.assertEqual(merged["children"]["CHILD00001"]["coupon"], "")
+        self.assertEqual(merged["children"]["CHILD00001"]["promotion"], "Deal")
+        self.assertEqual(merged["children"]["CHILD00001"]["inventory"], 9)
 
     def test_feishu_payload_uses_optional_signature(self):
         unsigned = monitor.feishu_payload("hello", timestamp=123, secret="")
@@ -200,10 +278,20 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(result, 0)
         collect.assert_not_called()
 
-    def test_partial_daily_report_records_delivery_without_replacing_baseline(self):
+    def test_partial_daily_report_merges_and_persists_snapshot(self):
         key = base64.urlsafe_b64encode(os.urandom(32)).decode()
-        previous = {"captured_at": "2026-07-09T01:15:00Z", "parents": {}, "children": {}, "errors": []}
-        current = {"captured_at": "2026-07-10T01:15:00Z", "parents": {}, "children": {}, "errors": ["PARENT1234: xingshang failed"]}
+        previous = {
+            "captured_at": "2026-07-09T01:15:00Z",
+            "parents": {"PARENT1234": {"major_rank": 10, "stars": 4.4, "child_asins": ["CHILD00001"]}},
+            "children": {"CHILD00001": {"price": 20.0, "inventory": 7}},
+            "errors": [],
+        }
+        current = {
+            "captured_at": "2026-07-10T01:15:00Z",
+            "parents": {"PARENT1234": {"major_rank": None, "stars": 4.5, "child_asins": ["CHILD00001"]}},
+            "children": {"CHILD00001": {"price": None, "inventory": 9}},
+            "errors": ["PARENT1234: xingshang failed"],
+        }
         with tempfile.TemporaryDirectory() as directory:
             state_path = os.path.join(directory, "latest.enc.json")
             delivery_path = os.path.join(directory, "delivery.enc.json")
@@ -218,7 +306,12 @@ class MonitorTest(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertTrue(send.called)
             self.assertEqual(monitor.load_delivery_date(delivery_path, key), "2026-07-10")
-            self.assertEqual(monitor.load_previous(state_path, key), previous)
+            saved = monitor.load_previous(state_path, key)
+            self.assertEqual(saved["captured_at"], "2026-07-10T01:15:00Z")
+            self.assertEqual(saved["parents"]["PARENT1234"]["major_rank"], 10)
+            self.assertEqual(saved["parents"]["PARENT1234"]["stars"], 4.5)
+            self.assertEqual(saved["children"]["CHILD00001"]["price"], 20.0)
+            self.assertEqual(saved["children"]["CHILD00001"]["inventory"], 9)
 
     def test_daily_report_does_not_record_delivery_when_feishu_fails(self):
         key = base64.urlsafe_b64encode(os.urandom(32)).decode()

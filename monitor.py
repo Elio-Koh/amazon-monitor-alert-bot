@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -864,6 +865,48 @@ def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, 
     return snapshot
 
 
+def snapshot_value_is_unknown(value: Any) -> bool:
+    if value is None:
+        return True
+    return isinstance(value, str) and value.strip().lower() in {"none", "unknown", "未知", "未覆盖"}
+
+
+def merge_snapshot(previous: Optional[Mapping[str, Any]], current: Mapping[str, Any]) -> Dict[str, Any]:
+    """Keep last known monitored values when a partial collection cannot cover them."""
+    merged = copy.deepcopy(dict(current))
+    if not previous:
+        return merged
+
+    previous_parents = previous.get("parents", {}) if isinstance(previous.get("parents"), Mapping) else {}
+    current_parents = merged.get("parents", {}) if isinstance(merged.get("parents"), Mapping) else {}
+    previous_children = previous.get("children", {}) if isinstance(previous.get("children"), Mapping) else {}
+    current_children = merged.get("children", {}) if isinstance(merged.get("children"), Mapping) else {}
+
+    for asin in set(previous_parents) & set(current_parents):
+        prior = previous_parents[asin]
+        latest = current_parents[asin]
+        if not isinstance(prior, Mapping) or not isinstance(latest, dict):
+            continue
+        for field in (*PARENT_FIELDS, "major_category", "minor_category"):
+            if snapshot_value_is_unknown(latest.get(field)) and not snapshot_value_is_unknown(prior.get(field)):
+                latest[field] = copy.deepcopy(prior.get(field))
+
+    for asin in set(previous_children) & set(current_children):
+        prior = previous_children[asin]
+        latest = current_children[asin]
+        if not isinstance(prior, Mapping) or not isinstance(latest, dict):
+            continue
+        for field in CHILD_FIELDS:
+            if snapshot_value_is_unknown(latest.get(field)) and not snapshot_value_is_unknown(prior.get(field)):
+                latest[field] = copy.deepcopy(prior.get(field))
+    return merged
+
+
+def field_changed(previous: Any, current: Any) -> bool:
+    # A newly covered field is not a business event; it only improves the baseline.
+    return not snapshot_value_is_unknown(previous) and previous != current
+
+
 def diff_snapshots(previous: Optional[Mapping[str, Any]], current: Mapping[str, Any]) -> List[str]:
     if not previous:
         return []
@@ -876,7 +919,7 @@ def diff_snapshots(previous: Optional[Mapping[str, Any]], current: Mapping[str, 
         prev = prev_parents.get(asin, {})
         cur = cur_parents.get(asin, {})
         for field in PARENT_FIELDS:
-            if prev.get(field) != cur.get(field):
+            if field_changed(prev.get(field), cur.get(field)):
                 changes.append(f"{asin} parent {field}: {prev.get(field)} -> {cur.get(field)}")
         prev_live_children = set(prev.get("child_asins") or [])
         cur_live_children = set(cur.get("child_asins") or [])
@@ -896,7 +939,7 @@ def diff_snapshots(previous: Optional[Mapping[str, Any]], current: Mapping[str, 
         prev = prev_children.get(asin, {})
         cur = cur_children.get(asin, {})
         for field in CHILD_FIELDS:
-            if prev.get(field) != cur.get(field):
+            if field_changed(prev.get(field), cur.get(field)):
                 changes.append(f"{asin} child {field}: {prev.get(field)} -> {cur.get(field)}")
     for error in current.get("errors") or []:
         changes.append(str(error))
@@ -1336,7 +1379,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     previous = load_previous(args.state, config["STATE_ENCRYPTION_KEY"])
     current = collect_snapshot(config, previous=previous)
-    changes = diff_snapshots(previous, current)
+    snapshot_to_persist = merge_snapshot(previous, current)
+    changes = diff_snapshots(previous, snapshot_to_persist)
     messages: List[str]
     if args.daily_report:
         messages = format_daily_report_messages(previous, current, changes)
@@ -1357,10 +1401,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 time.sleep(0.5)
             if args.daily_report:
                 save_delivery_date(args.delivery_state, config["STATE_ENCRYPTION_KEY"], today)
-    if not current.get("errors"):
-        save_current(args.output, current, config["STATE_ENCRYPTION_KEY"])
-    elif previous is None:
-        save_current(args.output, current, config["STATE_ENCRYPTION_KEY"])
+    if not args.dry_run:
+        save_current(args.output, snapshot_to_persist, config["STATE_ENCRYPTION_KEY"])
     return 0
 
 
