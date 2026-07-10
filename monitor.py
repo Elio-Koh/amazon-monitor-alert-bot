@@ -378,6 +378,8 @@ def normalize_promotion(detail: Mapping[str, Any]) -> Optional[str]:
         text = first_text(value)
         if not text:
             return
+        if text.upper() == "LTD":
+            text = "Limited time deal"
         lower = text.lower()
         if "amazon's choice" in lower or "amazon choice" in lower or "best seller" in lower:
             return
@@ -387,6 +389,9 @@ def normalize_promotion(detail: Mapping[str, Any]) -> Optional[str]:
     for key in ("promotion", "deal", "dealBadge", "dealType", "discountTypes"):
         for item in listify(detail.get(key)):
             add(item)
+    badge = first_text(detail.get("badge"))
+    if badge and (badge.upper() == "LTD" or any(label in badge.lower() for label in ("limited time deal", "lightning deal", "prime member price"))):
+        add(badge)
     savings = first_text(detail.get("savingsPercentage"))
     if savings:
         add(f"{savings} off")

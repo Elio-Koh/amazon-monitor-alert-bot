@@ -544,6 +544,16 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(deal["promotion"], "Limited time deal")
         self.assertEqual(choice["promotion"], "")
 
+    def test_normalizes_ltd_badge_when_discount_types_are_missing(self):
+        child = monitor.normalize_child(
+            "B0G5P8HWZ8",
+            {"asin": "B0G5P8HWZ8", "badge": "LTD", "savingsPercentage": "23%"},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Limited time deal; 23% off")
+
     def test_normalizes_pangolin_discount_types_savings_and_promotions(self):
         child = monitor.normalize_child(
             "B0GJZYZHJJ",
