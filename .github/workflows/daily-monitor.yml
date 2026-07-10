@@ -2,7 +2,8 @@ name: Daily ASIN Monitor
 
 on:
   schedule:
-    - cron: "0 1 * * *"
+    - cron: "15 1 * * *"
+    - cron: "30 1 * * *"
   workflow_dispatch:
     inputs:
       current_report:
@@ -11,6 +12,10 @@ on:
         default: "false"
       dry_run:
         description: "Print report to Actions logs without sending Feishu or publishing state"
+        required: false
+        default: "false"
+      daily_report:
+        description: "Compare against latest successful snapshot and send the daily report"
         required: false
         default: "false"
 
@@ -46,8 +51,11 @@ jobs:
       CURRENT_REPORT: ${{ github.event.inputs.current_report || 'false' }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       FORCE_CURRENT_REPORT: ${{ github.event.inputs.current_report == 'true' }}
+      DAILY_REPORT: ${{ github.event_name == 'schedule' || github.event.inputs.daily_report == 'true' }}
+      FORCE_DAILY_REPORT: ${{ github.event.inputs.daily_report == 'true' }}
       STATE_BRANCH: monitor-state
       STATE_PATH: state/latest.enc.json
+      DELIVERY_STATE_PATH: state/delivery.enc.json
     steps:
       - uses: actions/checkout@v4
 
@@ -67,6 +75,9 @@ jobs:
             if git cat-file -e "FETCH_HEAD:latest.enc.json" 2>/dev/null; then
               git show "FETCH_HEAD:latest.enc.json" > "$STATE_PATH"
             fi
+            if git cat-file -e "FETCH_HEAD:delivery.enc.json" 2>/dev/null; then
+              git show "FETCH_HEAD:delivery.enc.json" > "$DELIVERY_STATE_PATH"
+            fi
           fi
 
       - name: Run monitor
@@ -79,7 +90,13 @@ jobs:
           if [ "$DRY_RUN" = "true" ]; then
             args+=(--dry-run)
           fi
-          python monitor.py --state "$STATE_PATH" --output "$STATE_PATH" "${args[@]}"
+          if [ "$DAILY_REPORT" = "true" ]; then
+            args+=(--daily-report)
+          fi
+          if [ "$FORCE_DAILY_REPORT" = "true" ]; then
+            args+=(--force-daily-report)
+          fi
+          python monitor.py --state "$STATE_PATH" --output "$STATE_PATH" --delivery-state "$DELIVERY_STATE_PATH" "${args[@]}"
 
       - name: Publish state
         if: env.DRY_RUN != 'true'
@@ -88,12 +105,18 @@ jobs:
           rm -rf /tmp/monitor-state
           mkdir -p /tmp/monitor-state
           cp "$STATE_PATH" /tmp/monitor-state/latest.enc.json
+          if [ -f "$DELIVERY_STATE_PATH" ]; then
+            cp "$DELIVERY_STATE_PATH" /tmp/monitor-state/delivery.enc.json
+          fi
           cd /tmp/monitor-state
           git init
           git checkout -b "$STATE_BRANCH"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add latest.enc.json
+          if [ -f delivery.enc.json ]; then
+            git add delivery.enc.json
+          fi
           git commit -m "update asin monitor state"
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push --force origin "$STATE_BRANCH"

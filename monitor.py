@@ -100,6 +100,20 @@ def format_report_time(value: Any) -> str:
     return dt.astimezone(BEIJING_TZ).strftime("北京时间 %Y-%m-%d %H:%M:%S")
 
 
+def beijing_date(value: Any) -> datetime.date:
+    text = first_text(value)
+    if text:
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            dt = datetime.now(timezone.utc)
+    else:
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(BEIJING_TZ).date()
+
+
 def report_base_date(captured_at: Any, tz: ZoneInfo = DELIVERY_TZ) -> datetime.date:
     text = first_text(captured_at)
     if text:
@@ -926,6 +940,19 @@ def save_current(path: str, snapshot: Mapping[str, Any], key: str) -> None:
         handle.write(encrypt_snapshot(snapshot, key))
 
 
+def load_delivery_date(path: str, key: str) -> Optional[str]:
+    marker = load_previous(path, key)
+    if not marker:
+        return None
+    value = first_text(marker.get("delivered_on"))
+    return value if value and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) else None
+
+
+def save_delivery_date(path: str, key: str, delivered_on: str) -> None:
+    # ponytail: a Beijing calendar date is sufficient to suppress the backup run.
+    save_current(path, {"delivered_on": delivered_on}, key)
+
+
 def feishu_payload(text: str, *, timestamp: Optional[int] = None, secret: str = "") -> Dict[str, Any]:
     payload = {"msg_type": "text", "content": {"text": text}}
     if secret:
@@ -938,13 +965,18 @@ def feishu_payload(text: str, *, timestamp: Optional[int] = None, secret: str = 
 def send_feishu(text: str, webhook_url: str, secret: str = "") -> None:
     if not webhook_url:
         return
-    http_json(
+    response = http_json(
         "POST",
         webhook_url,
         feishu_payload(text, secret=secret),
         {"Content-Type": "application/json"},
         timeout=20,
     )
+    if isinstance(response, Mapping):
+        status = response.get("StatusCode", response.get("status_code"))
+        if status not in {None, 0, "0"}:
+            message = first_text(response.get("StatusMessage")) or first_text(response.get("status_message")) or "unknown error"
+            raise MonitorError(f"Feishu response {status}: {message}")
 
 
 FIELD_LABELS = {
@@ -1196,6 +1228,68 @@ def format_snapshot_report(snapshot: Mapping[str, Any]) -> str:
     return "\n\n---\n\n".join(format_snapshot_report_messages(snapshot))
 
 
+def changed_parent_asins(previous: Mapping[str, Any], current: Mapping[str, Any], changes: Sequence[str]) -> List[str]:
+    parent_asins = {
+        str(asin)
+        for snapshot in (previous, current)
+        for asin in (snapshot.get("parents", {}) if isinstance(snapshot.get("parents"), Mapping) else {})
+    }
+    memberships: Dict[str, set[str]] = {}
+    for snapshot in (previous, current):
+        parents = snapshot.get("parents", {}) if isinstance(snapshot.get("parents"), Mapping) else {}
+        for parent_asin, parent in parents.items():
+            if not isinstance(parent, Mapping):
+                continue
+            for field in ("child_asins", "inventory_only_asins"):
+                for child_asin in parent.get(field) or []:
+                    memberships.setdefault(str(child_asin), set()).add(str(parent_asin))
+    affected: set[str] = set()
+    for change in changes:
+        for asin in re.findall(r"\b[A-Z0-9]{10}\b", str(change)):
+            if asin in parent_asins:
+                affected.add(asin)
+            affected.update(memberships.get(asin, set()))
+    return sorted(affected)
+
+
+def format_daily_report_messages(
+    previous: Optional[Mapping[str, Any]], current: Mapping[str, Any], changes: Sequence[str]
+) -> List[str]:
+    captured_at = current.get("captured_at") or now_iso()
+    parents = current.get("parents", {}) if isinstance(current.get("parents"), Mapping) else {}
+    children = current.get("children", {}) if isinstance(current.get("children"), Mapping) else {}
+    total_children = sum(len(parent.get("child_asins") or []) for parent in parents.values() if isinstance(parent, Mapping))
+    total_inventory_only = sum(len(parent.get("inventory_only_asins") or []) for parent in parents.values() if isinstance(parent, Mapping))
+    errors = [str(error) for error in current.get("errors") or []]
+    current_date = beijing_date(captured_at)
+    if previous:
+        baseline_date = beijing_date(previous.get("captured_at"))
+        yesterday = baseline_date == current_date - timedelta(days=1)
+        baseline_label = f"{baseline_date}（{'昨日' if yesterday else '上次成功快照'}）"
+        status = f"发现 {len(changes)} 项变化" if changes else ("较昨日无变化" if yesterday else "较上次成功快照无变化")
+        affected = changed_parent_asins(previous, current, changes)
+    else:
+        baseline_label = "无（首次运行）"
+        status = "首次基线已建立"
+        affected = sorted(str(asin) for asin in parents)
+    overview = [
+        f"ASIN 每日监控｜{format_report_time(captured_at)}",
+        f"比较基线：{baseline_label}",
+        f"状态：{status}",
+        f"监控范围：父 ASIN：{len(parents)}｜正常子体：{total_children}｜库存侧异常：{total_inventory_only}｜数据源异常：{len(errors)}",
+    ]
+    if affected:
+        overview.extend(["", f"受影响父体：{'、'.join(affected)}"])
+    messages = ["\n".join(overview)]
+    if previous and changes:
+        messages.append(format_message(changes, captured_at=captured_at))
+    for parent_asin in affected:
+        parent = parents.get(parent_asin)
+        if isinstance(parent, Mapping):
+            messages.append(format_parent_snapshot_report(current, parent_asin, parent, children))
+    return messages
+
+
 def env_config() -> Dict[str, str]:
     required = ["PANGOLINFO_API_TOKEN", "FEISHU_WEBHOOK_URL", "MONITOR_PARENT_ASINS", "STATE_ENCRYPTION_KEY", "XINGSHANG_MCP_URL_TEMPLATE"]
     config = {key: os.environ.get(key, "") for key in required}
@@ -1226,16 +1320,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", default="state/latest.enc.json")
     parser.add_argument("--output", default="state/latest.enc.json")
+    parser.add_argument("--delivery-state", default="state/delivery.enc.json")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--report-current", action="store_true")
+    report_mode = parser.add_mutually_exclusive_group()
+    report_mode.add_argument("--report-current", action="store_true")
+    report_mode.add_argument("--daily-report", action="store_true")
+    parser.add_argument("--force-daily-report", action="store_true")
     args = parser.parse_args(argv)
+    if args.force_daily_report and not args.daily_report:
+        parser.error("--force-daily-report requires --daily-report")
 
     config = env_config()
+    today = str(beijing_date(now_iso()))
+    if args.daily_report and not args.force_daily_report and not args.dry_run and load_delivery_date(args.delivery_state, config["STATE_ENCRYPTION_KEY"]) == today:
+        return 0
     previous = load_previous(args.state, config["STATE_ENCRYPTION_KEY"])
     current = collect_snapshot(config, previous=previous)
     changes = diff_snapshots(previous, current)
     messages: List[str]
-    if args.report_current or config.get("FORCE_CURRENT_REPORT", "").lower() == "true":
+    if args.daily_report:
+        messages = format_daily_report_messages(previous, current, changes)
+    elif args.report_current or config.get("FORCE_CURRENT_REPORT", "").lower() == "true":
         messages = format_snapshot_report_messages(current)
     elif previous is None:
         messages = [format_message(changes, baseline=True)]
@@ -1250,6 +1355,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for message in messages:
                 send_feishu(message, config["FEISHU_WEBHOOK_URL"], config.get("FEISHU_WEBHOOK_SECRET", ""))
                 time.sleep(0.5)
+            if args.daily_report:
+                save_delivery_date(args.delivery_state, config["STATE_ENCRYPTION_KEY"], today)
     if not current.get("errors"):
         save_current(args.output, current, config["STATE_ENCRYPTION_KEY"])
     elif previous is None:
