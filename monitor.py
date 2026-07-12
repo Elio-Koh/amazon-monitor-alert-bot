@@ -678,13 +678,23 @@ def run_mcp(coro: Any, timeout: int) -> Any:
     return asyncio.run(asyncio.wait_for(coro, timeout=timeout))
 
 
-def fetch_inventory(parent_asin: str, url_template: str, timeout: int = 30, force_refresh: bool = False) -> Dict[str, Any]:
+def fetch_inventory(
+    parent_asin: str,
+    url_template: str,
+    timeout: int = 30,
+    force_refresh: bool = False,
+    spu_item_id_list: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
     if not url_template:
         return {}
     server_url = url_template.format(parent_asin=parent_asin.upper(), PARENT_ASIN=parent_asin.upper())
     if not server_url.endswith("/"):
         server_url += "/"
-    return run_mcp(call_mcp_tool(server_url, ("get_store_asin_info",), {"force_refresh": force_refresh}), timeout)
+    args: Dict[str, Any] = {"force_refresh": force_refresh}
+    scoped_asins = sorted({str(asin).upper() for asin in (spu_item_id_list or []) if is_asin(str(asin))})
+    if scoped_asins:
+        args["spu_item_id_list"] = scoped_asins
+    return run_mcp(call_mcp_tool(server_url, ("get_store_asin_info",), args), timeout)
 
 
 def fetch_optional_detail_from_mcp(
@@ -808,6 +818,23 @@ def collect_snapshot(config: Mapping[str, str], previous: Optional[Mapping[str, 
                 snapshot["warnings"].append(f"{parent_asin}: xingshang failed; using previous inventory snapshot")
             snapshot["errors"].append(error)
         inventories = inventory_by_asin(inventory_payload)
+        if parent.get("inventory_source") != "previous_snapshot" and inventory_payload and not inventories:
+            scoped_child_asins = sorted({str(asin).upper() for asin in parent.get("child_asins") or [] if is_asin(str(asin))})
+            if scoped_child_asins:
+                try:
+                    scoped_inventory_payload = fetch_inventory(
+                        parent_asin,
+                        config.get("XINGSHANG_MCP_URL_TEMPLATE", ""),
+                        timeout=xingshang_timeout,
+                        force_refresh=xingshang_force_refresh,
+                        spu_item_id_list=scoped_child_asins,
+                    )
+                    scoped_inventories = inventory_by_asin(scoped_inventory_payload)
+                    if scoped_inventories:
+                        inventory_payload = scoped_inventory_payload
+                        inventories = scoped_inventories
+                except Exception as exc:
+                    snapshot["errors"].append(f"{parent_asin}: xingshang scoped retry failed: {describe_exception(exc, timeout=xingshang_timeout)}")
         if parent.get("inventory_source") != "previous_snapshot":
             if inventories:
                 parent["inventory_source"] = "xingshang"

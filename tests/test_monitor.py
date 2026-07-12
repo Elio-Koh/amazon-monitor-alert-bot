@@ -1013,6 +1013,59 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(snapshot["children"]["B0GJZYZHJJ"]["inventory"], 16)
         self.assertIn("库存 xingshang 未返回库存明细", monitor.format_snapshot_report(snapshot))
 
+    def test_collect_snapshot_retries_empty_xingshang_with_front_child_asins(self):
+        inventory_calls = []
+
+        def fake_pangolin(token, parser_name, content, *, site, zipcode, timeout):
+            if content == "B0H1Q77TDL":
+                return {
+                    "data": {
+                        "json": {
+                            "data": {
+                                "results": [
+                                    {
+                                        "asin": content,
+                                        "variationList": [{"asin": "B0G5P8HWZ8"}, {"asin": "B0GJZYZHJJ"}],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            return {"data": {"json": {"data": {"results": [{"asin": content, "price": "$42.29"}]}}}}
+
+        def fake_inventory(parent_asin, url_template, timeout=30, force_refresh=False, spu_item_id_list=None):
+            inventory_calls.append(spu_item_id_list)
+            if spu_item_id_list:
+                return {
+                    "items": [
+                        {"asin": "B0G5P8HWZ8", "inventory": 21},
+                        {"asin": "B0GJZYZHJJ", "inventory": 13},
+                    ]
+                }
+            return {"success": True, "items": []}
+
+        with (
+            patch("monitor.pangolin_scrape", side_effect=fake_pangolin),
+            patch("monitor.fetch_fallback_detail", return_value=({}, "")),
+            patch("monitor.fetch_inventory", side_effect=fake_inventory),
+        ):
+            snapshot = monitor.collect_snapshot(
+                {
+                    "PANGOLINFO_API_TOKEN": "token",
+                    "MONITOR_PARENT_ASINS": "B0H1Q77TDL",
+                    "XINGSHANG_MCP_URL_TEMPLATE": "https://example.com/{parent_asin}",
+                    "MARKETPLACE": "US",
+                    "PANGOLIN_ZIPCODE": "10041",
+                    "MCP_TIMEOUT_SECONDS": "1",
+                }
+            )
+
+        self.assertEqual(inventory_calls, [None, ["B0G5P8HWZ8", "B0GJZYZHJJ"]])
+        self.assertEqual(snapshot["parents"]["B0H1Q77TDL"]["inventory_source"], "xingshang")
+        self.assertEqual(snapshot["children"]["B0G5P8HWZ8"]["inventory"], 21)
+        self.assertEqual(snapshot["children"]["B0GJZYZHJJ"]["inventory"], 13)
+
     def test_collect_snapshot_uses_previous_inventory_when_xingshang_times_out(self):
         previous = {
             "parents": {"B0FFT1JQ9T": {"child_asins": ["B0FFT34472", "B0FVX93K44"]}},
