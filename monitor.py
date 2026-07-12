@@ -1107,6 +1107,94 @@ def format_message(changes: Sequence[str], *, baseline: bool = False, captured_a
     return "\n".join(lines)
 
 
+def format_change_field_value(field: str, value: Any, captured_at: Any) -> str:
+    if field == "delivery_promise":
+        return format_delivery_days(value, captured_at)
+    if field in {"coupon", "promotion"} and value == "":
+        return "无"
+    return format_change_value(value)
+
+
+def child_belongs_to_parent(parent_asin: str, child_asin: str, previous: Optional[Mapping[str, Any]], current: Mapping[str, Any]) -> bool:
+    for snapshot in (previous, current):
+        if not snapshot:
+            continue
+        parents = snapshot.get("parents", {}) if isinstance(snapshot.get("parents"), Mapping) else {}
+        parent = parents.get(parent_asin)
+        if not isinstance(parent, Mapping):
+            continue
+        for field in ("child_asins", "inventory_only_asins"):
+            if child_asin in {str(asin) for asin in parent.get(field) or []}:
+                return True
+    return False
+
+
+def format_parent_change_lines(
+    parent_asin: str, previous: Optional[Mapping[str, Any]], current: Mapping[str, Any], changes: Sequence[str]
+) -> List[str]:
+    captured_at = current.get("captured_at") or now_iso()
+    lines: List[str] = []
+    inventory_changes = 0
+    for raw in changes:
+        line = str(raw)
+        match = re.fullmatch(r"([A-Z0-9]{10}) parent ([a-z_]+): (.*) -> (.*)", line)
+        if match:
+            asin, field, before, after = match.groups()
+            if asin == parent_asin:
+                label = FIELD_LABELS.get(field, field)
+                lines.append(
+                    f"- {label}：{format_change_field_value(field, before, captured_at)} → {format_change_field_value(field, after, captured_at)}"
+                )
+            continue
+        match = re.fullmatch(r"([A-Z0-9]{10}) child ([a-z_]+): (.*) -> (.*)", line)
+        if match:
+            child_asin, field, before, after = match.groups()
+            if child_belongs_to_parent(parent_asin, child_asin, previous, current):
+                if field == "inventory":
+                    inventory_changes += 1
+                else:
+                    label = FIELD_LABELS.get(field, field)
+                    lines.append(
+                        f"- {child_asin} {label}：{format_change_field_value(field, before, captured_at)} → {format_change_field_value(field, after, captured_at)}"
+                    )
+            continue
+        match = re.fullmatch(r"([A-Z0-9]{10}) child (added|removed): ([A-Z0-9]{10})", line)
+        if match:
+            asin, action, child_asin = match.groups()
+            if asin == parent_asin:
+                label = "新增子体" if action == "added" else "解绑子体"
+                lines.append(f"- {label}：{child_asin}")
+            continue
+        match = re.fullmatch(r"([A-Z0-9]{10}) inventory-only child (added|removed): ([A-Z0-9]{10})", line)
+        if match:
+            asin, action, child_asin = match.groups()
+            if asin == parent_asin:
+                label = "新增库存侧异常" if action == "added" else "移除库存侧异常"
+                lines.append(f"- {label}：{child_asin}")
+            continue
+        if parent_asin in line:
+            lines.append(f"- 数据源异常：{line}")
+    if inventory_changes:
+        lines.append(f"- 库存变化：{inventory_changes} 个子体")
+    return lines
+
+
+def child_change_markers(
+    child_asin: str, previous: Optional[Mapping[str, Any]], current: Mapping[str, Any], changes: Sequence[str]
+) -> Dict[str, str]:
+    captured_at = current.get("captured_at") or now_iso()
+    markers: Dict[str, str] = {}
+    for raw in changes:
+        match = re.fullmatch(r"([A-Z0-9]{10}) child ([a-z_]+): (.*) -> (.*)", str(raw))
+        if not match:
+            continue
+        asin, field, before, after = match.groups()
+        if asin != child_asin or field == "inventory":
+            continue
+        markers[field] = f"（{format_change_field_value(field, before, captured_at)}→{format_change_field_value(field, after, captured_at)}）"
+    return markers
+
+
 def format_rank(rank: Any, category: Any) -> str:
     if rank is None:
         return "未知"
@@ -1198,26 +1286,41 @@ def format_source_summary(snapshot: Mapping[str, Any], parent: Mapping[str, Any]
     return "；".join(parts)
 
 
-def format_parent_snapshot_report(snapshot: Mapping[str, Any], parent_asin: str, parent: Mapping[str, Any], children: Mapping[str, Any]) -> str:
+def format_parent_snapshot_report(
+    snapshot: Mapping[str, Any],
+    parent_asin: str,
+    parent: Mapping[str, Any],
+    children: Mapping[str, Any],
+    previous: Optional[Mapping[str, Any]] = None,
+    changes: Sequence[str] = (),
+) -> str:
     child_asins = [str(asin) for asin in parent.get("child_asins") or []]
     inventory_only_asins = [str(asin) for asin in parent.get("inventory_only_asins") or []]
-    lines = [f"ASIN 今日数据｜{format_report_time(snapshot.get('captured_at') or now_iso())}", f"父 ASIN {parent_asin}"]
+    captured_at = snapshot.get("captured_at") or now_iso()
+    change_lines = format_parent_change_lines(parent_asin, previous, snapshot, changes) if previous and changes else []
+    title = "ASIN 变化明细" if change_lines else "ASIN 今日数据"
+    lines = [f"{title}｜{format_report_time(captured_at)}", f"父 ASIN {parent_asin}"]
     if not has_front_detail(parent):
         lines.append("- 前台数据缺失")
     lines.append(f"- 大类排名: {format_rank(parent.get('major_rank'), parent.get('major_category'))}")
     lines.append(f"- 小类排名: {format_rank(parent.get('minor_rank'), parent.get('minor_category'))}")
     lines.append(f"- 评分：{format_value(parent.get('stars'))}｜评论：{format_value(parent.get('rating_count'))}｜子体：{len(child_asins)}｜异常：{len(inventory_only_asins)}")
+    if change_lines:
+        lines.append("")
+        lines.append("变化摘要：")
+        lines.extend(change_lines)
     lines.append("")
     lines.append("子体明细：")
     for index, child_asin in enumerate(sorted(child_asins), 1):
         child = children.get(child_asin, {})
+        markers = child_change_markers(child_asin, previous, snapshot, changes) if change_lines else {}
         lines.append(
             f"{index}. {child_asin}｜"
-            f"价 {format_value(child.get('price'))}｜"
+            f"价 {format_value(child.get('price'))}{markers.get('price', '')}｜"
             f"库存 {format_value(child.get('inventory'))}｜"
-            f"Coupon {format_optional_text(child.get('coupon'), child)}｜"
-            f"促销 {format_optional_text(child.get('promotion'), child)}｜"
-            f"时效 {format_delivery_days(child.get('delivery_promise'), snapshot.get('captured_at') or now_iso())}"
+            f"Coupon {format_optional_text(child.get('coupon'), child)}{markers.get('coupon', '')}｜"
+            f"促销 {format_optional_text(child.get('promotion'), child)}{markers.get('promotion', '')}｜"
+            f"时效 {format_delivery_days(child.get('delivery_promise'), captured_at)}{markers.get('delivery_promise', '')}"
         )
     if inventory_only_asins:
         lines.append("")
@@ -1334,7 +1437,7 @@ def format_daily_report_messages(
     for parent_asin in affected:
         parent = parents.get(parent_asin)
         if isinstance(parent, Mapping):
-            messages.append(format_parent_snapshot_report(current, parent_asin, parent, children))
+            messages.append(format_parent_snapshot_report(current, parent_asin, parent, children, previous, changes))
     return messages
 
 
@@ -1373,10 +1476,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report_mode = parser.add_mutually_exclusive_group()
     report_mode.add_argument("--report-current", action="store_true")
     report_mode.add_argument("--daily-report", action="store_true")
+    report_mode.add_argument("--render-state-only", action="store_true")
     parser.add_argument("--force-daily-report", action="store_true")
     args = parser.parse_args(argv)
     if args.force_daily_report and not args.daily_report:
         parser.error("--force-daily-report requires --daily-report")
+
+    if args.render_state_only:
+        key = os.environ.get("STATE_ENCRYPTION_KEY", "")
+        if not key:
+            raise MonitorError("missing required env vars: STATE_ENCRYPTION_KEY")
+        snapshot = load_previous(args.state, key)
+        if snapshot is None:
+            raise MonitorError(f"state file not found: {args.state}")
+        print(format_snapshot_report(snapshot))
+        return 0
 
     config = env_config()
     today = str(beijing_date(now_iso()))
@@ -1388,7 +1502,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     changes = diff_snapshots(previous, snapshot_to_persist)
     messages: List[str]
     if args.daily_report:
-        messages = format_daily_report_messages(previous, current, changes)
+        messages = format_daily_report_messages(previous, snapshot_to_persist, changes)
     elif args.report_current or config.get("FORCE_CURRENT_REPORT", "").lower() == "true":
         messages = format_snapshot_report_messages(current)
     elif previous is None:

@@ -18,6 +18,10 @@ on:
         description: "Compare against latest successful snapshot and send the daily report"
         required: false
         default: "false"
+      render_state_only:
+        description: "Decrypt latest monitor-state snapshot and print/upload a report without collecting or sending"
+        required: false
+        default: "false"
 
 permissions:
   contents: write
@@ -53,6 +57,7 @@ jobs:
       FORCE_CURRENT_REPORT: ${{ github.event.inputs.current_report == 'true' }}
       DAILY_REPORT: ${{ github.event_name == 'schedule' || github.event.inputs.daily_report == 'true' }}
       FORCE_DAILY_REPORT: ${{ github.event.inputs.daily_report == 'true' }}
+      RENDER_STATE_ONLY: ${{ github.event.inputs.render_state_only || 'false' }}
       STATE_BRANCH: monitor-state
       STATE_PATH: state/latest.enc.json
       DELIVERY_STATE_PATH: state/delivery.enc.json
@@ -83,6 +88,11 @@ jobs:
       - name: Run monitor
         run: |
           set -euo pipefail
+          if [ "$RENDER_STATE_ONLY" = "true" ]; then
+            python monitor.py --state "$STATE_PATH" --render-state-only > state-report.txt
+            cat state-report.txt
+            exit 0
+          fi
           args=()
           if [ "$CURRENT_REPORT" = "true" ]; then
             args+=(--report-current)
@@ -98,8 +108,15 @@ jobs:
           fi
           python monitor.py --state "$STATE_PATH" --output "$STATE_PATH" --delivery-state "$DELIVERY_STATE_PATH" "${args[@]}"
 
+      - name: Upload rendered state report
+        if: env.RENDER_STATE_ONLY == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: asin-rendered-state-report
+          path: state-report.txt
+
       - name: Publish state
-        if: env.DRY_RUN != 'true'
+        if: env.DRY_RUN != 'true' && env.RENDER_STATE_ONLY != 'true'
         run: |
           set -euo pipefail
           rm -rf /tmp/monitor-state

@@ -1,4 +1,5 @@
 import base64
+import io
 import json
 import os
 import tempfile
@@ -253,6 +254,48 @@ class MonitorTest(unittest.TestCase):
         self.assertTrue(any("父 ASIN PARENT1234" in message for message in messages))
         self.assertFalse(any("父 ASIN PARENT5678" in message for message in messages))
 
+    def test_daily_parent_detail_embeds_changes_except_inventory_inline_marks(self):
+        previous = {
+            "captured_at": "2026-07-09T01:15:00Z",
+            "parents": {
+                "PARENT1234": {"major_rank": 100, "stars": 4.5, "child_asins": ["CHILD00001"], "source": "pangolin"}
+            },
+            "children": {
+                "CHILD00001": {"price": 10.0, "inventory": 5, "promotion": "", "delivery_promise": "Wednesday, July 15"}
+            },
+            "errors": [],
+        }
+        current = {
+            "captured_at": "2026-07-10T01:15:00Z",
+            "parents": {
+                "PARENT1234": {"major_rank": 90, "stars": 4.6, "child_asins": ["CHILD00001"], "source": "pangolin"}
+            },
+            "children": {
+                "CHILD00001": {
+                    "price": 11.0,
+                    "inventory": 7,
+                    "promotion": "Limited time deal; 10% off",
+                    "delivery_promise": "Thursday, July 16",
+                }
+            },
+            "errors": [],
+        }
+        changes = monitor.diff_snapshots(previous, current)
+
+        messages = monitor.format_daily_report_messages(previous, current, changes)
+        detail = next(message for message in messages if "父 ASIN PARENT1234" in message and "子体明细：" in message)
+
+        self.assertIn("ASIN 变化明细｜北京时间 2026-07-10 09:15:00", detail)
+        self.assertIn("变化摘要：", detail)
+        self.assertIn("- 大类排名：100 → 90", detail)
+        self.assertIn("- CHILD00001 价格：10.0 → 11.0", detail)
+        self.assertIn("- 库存变化：1 个子体", detail)
+        self.assertIn("价 11.0（10.0→11.0）", detail)
+        self.assertIn("促销 Limited time deal; 10% off（无→Limited time deal; 10% off）", detail)
+        self.assertIn("时效 7天（7/16）（6天（7/15）→7天（7/16））", detail)
+        self.assertIn("库存 7｜", detail)
+        self.assertNotIn("库存 7（5→7）", detail)
+
     def test_delivery_date_round_trips_in_encrypted_state(self):
         key = base64.urlsafe_b64encode(os.urandom(32)).decode()
         with tempfile.TemporaryDirectory() as directory:
@@ -277,6 +320,26 @@ class MonitorTest(unittest.TestCase):
 
         self.assertEqual(result, 0)
         collect.assert_not_called()
+
+    def test_render_state_only_prints_existing_snapshot_without_required_sources(self):
+        key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+        snapshot = {
+            "captured_at": "2026-07-12T04:52:16Z",
+            "parents": {"PARENT1234": {"major_rank": 1, "child_asins": ["CHILD00001"], "source": "pangolin"}},
+            "children": {"CHILD00001": {"price": 10.0}},
+            "errors": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "latest.enc.json")
+            monitor.save_current(state_path, snapshot, key)
+            stdout = io.StringIO()
+
+            with patch.dict(os.environ, {"STATE_ENCRYPTION_KEY": key}, clear=True), patch("monitor.collect_snapshot") as collect, patch("sys.stdout", stdout):
+                self.assertEqual(monitor.main(["--state", state_path, "--render-state-only"]), 0)
+
+            collect.assert_not_called()
+            self.assertIn("ASIN 今日数据总览｜北京时间 2026-07-12 12:52:16", stdout.getvalue())
+            self.assertIn("父 ASIN PARENT1234", stdout.getvalue())
 
     def test_partial_daily_report_merges_and_persists_snapshot(self):
         key = base64.urlsafe_b64encode(os.urandom(32)).decode()
