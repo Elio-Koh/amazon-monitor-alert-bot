@@ -341,6 +341,39 @@ class MonitorTest(unittest.TestCase):
             self.assertIn("ASIN 今日数据总览｜北京时间 2026-07-12 12:52:16", stdout.getvalue())
             self.assertIn("父 ASIN PARENT1234", stdout.getvalue())
 
+    def test_render_state_only_with_previous_state_prints_daily_change_report(self):
+        key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+        previous = {
+            "captured_at": "2026-07-11T01:15:00Z",
+            "parents": {"PARENT1234": {"major_rank": 100, "child_asins": ["CHILD00001"], "source": "pangolin"}},
+            "children": {"CHILD00001": {"price": 10.0, "inventory": 5}},
+            "errors": [],
+        }
+        current = {
+            "captured_at": "2026-07-12T01:15:00Z",
+            "parents": {"PARENT1234": {"major_rank": 90, "child_asins": ["CHILD00001"], "source": "pangolin"}},
+            "children": {"CHILD00001": {"price": 11.0, "inventory": 7}},
+            "errors": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "latest.enc.json")
+            previous_path = os.path.join(directory, "previous.enc.json")
+            monitor.save_current(state_path, current, key)
+            monitor.save_current(previous_path, previous, key)
+            stdout = io.StringIO()
+
+            with patch.dict(os.environ, {"STATE_ENCRYPTION_KEY": key}, clear=True), patch("monitor.collect_snapshot") as collect, patch("sys.stdout", stdout):
+                self.assertEqual(monitor.main(["--state", state_path, "--previous-state", previous_path, "--render-state-only"]), 0)
+
+            output = stdout.getvalue()
+            collect.assert_not_called()
+            self.assertIn("ASIN 每日监控｜北京时间 2026-07-12 09:15:00", output)
+            self.assertIn("比较基线：2026-07-11（昨日）", output)
+            self.assertIn("状态：发现 3 项变化", output)
+            self.assertIn("ASIN 变化明细｜北京时间 2026-07-12 09:15:00", output)
+            self.assertIn("- 大类排名：100 → 90", output)
+            self.assertIn("价 11.0（10.0→11.0）", output)
+
     def test_partial_daily_report_merges_and_persists_snapshot(self):
         key = base64.urlsafe_b64encode(os.urandom(32)).decode()
         previous = {

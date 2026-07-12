@@ -60,6 +60,7 @@ jobs:
       RENDER_STATE_ONLY: ${{ github.event.inputs.render_state_only || 'false' }}
       STATE_BRANCH: monitor-state
       STATE_PATH: state/latest.enc.json
+      PREVIOUS_STATE_PATH: state/previous.enc.json
       DELIVERY_STATE_PATH: state/delivery.enc.json
     steps:
       - uses: actions/checkout@v4
@@ -80,16 +81,22 @@ jobs:
             if git cat-file -e "FETCH_HEAD:latest.enc.json" 2>/dev/null; then
               git show "FETCH_HEAD:latest.enc.json" > "$STATE_PATH"
             fi
+            if git cat-file -e "FETCH_HEAD:previous.enc.json" 2>/dev/null; then
+              git show "FETCH_HEAD:previous.enc.json" > "$PREVIOUS_STATE_PATH"
+            fi
             if git cat-file -e "FETCH_HEAD:delivery.enc.json" 2>/dev/null; then
               git show "FETCH_HEAD:delivery.enc.json" > "$DELIVERY_STATE_PATH"
             fi
+          fi
+          if [ "$RENDER_STATE_ONLY" != "true" ] && [ -f "$STATE_PATH" ]; then
+            cp "$STATE_PATH" "$PREVIOUS_STATE_PATH"
           fi
 
       - name: Run monitor
         run: |
           set -euo pipefail
           if [ "$RENDER_STATE_ONLY" = "true" ]; then
-            python monitor.py --state "$STATE_PATH" --render-state-only > state-report.txt
+            python monitor.py --state "$STATE_PATH" --previous-state "$PREVIOUS_STATE_PATH" --render-state-only > state-report.txt
             cat state-report.txt
             exit 0
           fi
@@ -122,6 +129,9 @@ jobs:
           rm -rf /tmp/monitor-state
           mkdir -p /tmp/monitor-state
           cp "$STATE_PATH" /tmp/monitor-state/latest.enc.json
+          if [ -f "$PREVIOUS_STATE_PATH" ]; then
+            cp "$PREVIOUS_STATE_PATH" /tmp/monitor-state/previous.enc.json
+          fi
           if [ -f "$DELIVERY_STATE_PATH" ]; then
             cp "$DELIVERY_STATE_PATH" /tmp/monitor-state/delivery.enc.json
           fi
@@ -131,6 +141,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add latest.enc.json
+          if [ -f previous.enc.json ]; then
+            git add previous.enc.json
+          fi
           if [ -f delivery.enc.json ]; then
             git add delivery.enc.json
           fi

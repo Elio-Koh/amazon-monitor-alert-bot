@@ -1470,6 +1470,7 @@ def env_config() -> Dict[str, str]:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", default="state/latest.enc.json")
+    parser.add_argument("--previous-state", default="state/previous.enc.json")
     parser.add_argument("--output", default="state/latest.enc.json")
     parser.add_argument("--delivery-state", default="state/delivery.enc.json")
     parser.add_argument("--dry-run", action="store_true")
@@ -1489,7 +1490,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         snapshot = load_previous(args.state, key)
         if snapshot is None:
             raise MonitorError(f"state file not found: {args.state}")
-        print(format_snapshot_report(snapshot))
+        previous = load_previous(args.previous_state, key)
+        if previous is not None:
+            changes = diff_snapshots(previous, snapshot)
+            print("\n\n---\n\n".join(format_daily_report_messages(previous, snapshot, changes)))
+        else:
+            print(format_snapshot_report(snapshot))
         return 0
 
     config = env_config()
