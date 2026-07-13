@@ -123,7 +123,7 @@ def format_report_time(value: Any) -> str:
 
 
 def _section_lines(title: str, events: List[ChangeEvent], limit: int) -> List[str]:
-    if not events:
+    if not events or limit <= 0:
         return []
 
     lines = ["", title]
@@ -156,8 +156,7 @@ def render_text_summary(events: Iterable[ChangeEvent], captured_at: str, config:
     ]
     lines.extend(_section_lines("P0 必看：", p0, config.max_summary_items))
     remaining = max(0, config.max_summary_items - min(len(p0), config.max_summary_items))
-    p1_limit = remaining if remaining > 0 else config.max_summary_items
-    lines.extend(_section_lines("P1 复核：", p1, p1_limit))
+    lines.extend(_section_lines("P1 复核：", p1, remaining))
     if config.full_report_url:
         lines.extend(["", f"完整报告：{config.full_report_url}"])
     return "\n".join(lines)

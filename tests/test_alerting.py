@@ -157,6 +157,21 @@ class AlertingTest(unittest.TestCase):
 
         self.assertEqual(summary, "")
 
+    def test_render_text_summary_does_not_render_p1_when_p0_consumes_item_budget(self):
+        events = [
+            alerting.ChangeEvent("P0", "promotion", "PARENT1234", "CHILD00001", "promotion", "Deal", "", "CHILD00001 促销/Deal结束", "促销/Deal：Deal -> 无", "检查广告预算、价格竞争力和促销排期", "raw1"),
+            alerting.ChangeEvent("P1", "price", "PARENT1234", "CHILD00002", "price", "20.0", "21.2", "CHILD00002 价格变化", "价格：20.0 -> 21.2", "检查竞品价格、广告 ACOS 和预算", "raw2"),
+        ]
+
+        summary = alerting.render_text_summary(
+            events,
+            "2026-07-13T01:15:00Z",
+            alerting.AlertConfig(max_summary_items=1),
+        )
+
+        self.assertIn("CHILD00001 促销/Deal结束", summary)
+        self.assertNotIn("CHILD00002 价格变化", summary)
+
     def test_apply_dedupe_suppresses_same_event_within_window(self):
         event = alerting.ChangeEvent(
             "P1",
