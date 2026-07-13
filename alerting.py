@@ -123,11 +123,12 @@ def format_report_time(value: Any) -> str:
 
 
 def _section_lines(title: str, events: List[ChangeEvent], limit: int) -> List[str]:
-    if not events or limit <= 0:
+    if not events:
         return []
 
     lines = ["", title]
-    for index, event in enumerate(events[:limit], start=1):
+    visible = events[:max(0, limit)]
+    for index, event in enumerate(visible, start=1):
         parent_suffix = f"｜父体 {event.parent_asin}" if event.parent_asin else ""
         lines.extend(
             [
@@ -136,7 +137,7 @@ def _section_lines(title: str, events: List[ChangeEvent], limit: int) -> List[st
                 f"   建议：{event.action}",
             ]
         )
-    hidden = len(events) - limit
+    hidden = len(events) - len(visible)
     if hidden > 0:
         lines.append(f"... 还有 {hidden} 项同级重点事项，见完整报告")
     return lines
