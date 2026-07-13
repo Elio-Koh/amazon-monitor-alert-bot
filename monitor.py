@@ -1028,13 +1028,36 @@ def save_delivery_date(path: str, key: str, delivered_on: str) -> None:
     save_current(path, {"delivered_on": delivered_on}, key)
 
 
-def feishu_payload(text: str, *, timestamp: Optional[int] = None, secret: str = "") -> Dict[str, Any]:
-    payload = {"msg_type": "text", "content": {"text": text}}
+def sign_feishu_payload(payload: Dict[str, Any], *, timestamp: Optional[int] = None, secret: str = "") -> Dict[str, Any]:
+    out = dict(payload)
     if secret:
         ts = str(timestamp or int(time.time()))
         sign = hmac.new(f"{ts}\n{secret}".encode("utf-8"), b"", hashlib.sha256).digest()
-        payload.update({"timestamp": ts, "sign": base64.b64encode(sign).decode("ascii")})
-    return payload
+        out.update({"timestamp": ts, "sign": base64.b64encode(sign).decode("ascii")})
+    return out
+
+
+def feishu_payload(text: str, *, timestamp: Optional[int] = None, secret: str = "") -> Dict[str, Any]:
+    return sign_feishu_payload({"msg_type": "text", "content": {"text": text}}, timestamp=timestamp, secret=secret)
+
+
+def feishu_card_payload(card: Mapping[str, Any], *, timestamp: Optional[int] = None, secret: str = "") -> Dict[str, Any]:
+    return sign_feishu_payload({"msg_type": "interactive", "card": dict(card)}, timestamp=timestamp, secret=secret)
+
+
+def build_feishu_alert_card(summary_text: str) -> Dict[str, Any]:
+    first_line = summary_text.splitlines()[0] if summary_text.splitlines() else "ASIN 每日重点提醒"
+    template = "red" if "P0 " in summary_text else "orange"
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": template,
+            "title": {"tag": "plain_text", "content": first_line.split("｜", 1)[0]},
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": summary_text}},
+        ],
+    }
 
 
 def send_feishu(text: str, webhook_url: str, secret: str = "") -> None:
@@ -1052,6 +1075,37 @@ def send_feishu(text: str, webhook_url: str, secret: str = "") -> None:
         if status not in {None, 0, "0"}:
             message = first_text(response.get("StatusMessage")) or first_text(response.get("status_message")) or "unknown error"
             raise MonitorError(f"Feishu response {status}: {message}")
+
+
+def send_feishu_payload(payload: Mapping[str, Any], webhook_url: str) -> None:
+    if not webhook_url:
+        return
+    response = http_json(
+        "POST",
+        webhook_url,
+        payload,
+        {"Content-Type": "application/json"},
+        timeout=20,
+    )
+    if isinstance(response, Mapping):
+        status = response.get("StatusCode", response.get("status_code"))
+        if status not in {None, 0, "0"}:
+            message = first_text(response.get("StatusMessage")) or first_text(response.get("status_message")) or "unknown error"
+            raise MonitorError(f"Feishu response {status}: {message}")
+
+
+def send_daily_alert_payload(primary_payload: Mapping[str, Any], fallback_payload: Optional[Mapping[str, Any]], webhook_url: str) -> None:
+    try:
+        send_feishu_payload(primary_payload, webhook_url)
+    except MonitorError:
+        if (
+            fallback_payload
+            and primary_payload.get("msg_type") == "interactive"
+            and fallback_payload.get("msg_type") == "text"
+        ):
+            send_feishu_payload(fallback_payload, webhook_url)
+            return
+        raise
 
 
 FIELD_LABELS = {

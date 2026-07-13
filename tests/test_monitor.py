@@ -186,13 +186,76 @@ class MonitorTest(unittest.TestCase):
 
         self.assertNotIn("sign", unsigned)
         self.assertEqual(unsigned["msg_type"], "text")
-        self.assertIn("sign", signed)
         self.assertEqual(signed["timestamp"], "123")
+        self.assertEqual(signed["sign"], "/1VVdZH3KitTHu9FiYl+TZ0EGq/rppGGi7XFsB5aJSA=")
+
+    def test_feishu_card_payload_uses_optional_signature(self):
+        card = {
+            "config": {"wide_screen_mode": True},
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "hello"}}],
+            "header": {"title": {"tag": "plain_text", "content": "title"}, "template": "red"},
+        }
+
+        unsigned = monitor.feishu_card_payload(card, timestamp=123, secret="")
+        signed = monitor.feishu_card_payload(card, timestamp=123, secret="secret")
+
+        self.assertEqual(unsigned["msg_type"], "interactive")
+        self.assertEqual(unsigned["card"], card)
+        self.assertNotIn("sign", unsigned)
+        self.assertEqual(signed["timestamp"], "123")
+        self.assertEqual(signed["sign"], "/1VVdZH3KitTHu9FiYl+TZ0EGq/rppGGi7XFsB5aJSA=")
+
+    def test_build_feishu_alert_card_contains_summary_markdown(self):
+        card = monitor.build_feishu_alert_card("ASIN 每日重点提醒\n\nP0 必看：\n1. CHILD00001 库存归零")
+
+        self.assertEqual(card["config"]["wide_screen_mode"], True)
+        self.assertEqual(card["header"]["template"], "red")
+        self.assertEqual(card["header"]["title"]["content"], "ASIN 每日重点提醒")
+        self.assertEqual(card["elements"][0]["tag"], "div")
+        self.assertIn("P0 必看", card["elements"][0]["text"]["content"])
+
+    def test_send_daily_alert_payload_falls_back_to_text_when_card_fails(self):
+        card_payload = {"msg_type": "interactive", "card": {"elements": []}}
+        text_payload = {"msg_type": "text", "content": {"text": "fallback"}}
+
+        with patch("monitor.send_feishu_payload", side_effect=[monitor.MonitorError("card rejected"), None]) as send:
+            monitor.send_daily_alert_payload(card_payload, text_payload, "https://example.com")
+
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(send.call_args_list[0].args[0], card_payload)
+        self.assertEqual(send.call_args_list[1].args[0], text_payload)
+
+    def test_send_daily_alert_payload_does_not_fallback_to_interactive_payload(self):
+        primary_payload = {"msg_type": "interactive", "card": {}}
+        fallback_payload = {"msg_type": "interactive", "card": {}}
+
+        with patch("monitor.send_feishu_payload", side_effect=monitor.MonitorError("card rejected")) as send:
+            with self.assertRaisesRegex(monitor.MonitorError, "card rejected"):
+                monitor.send_daily_alert_payload(primary_payload, fallback_payload, "https://example.com")
+
+        self.assertEqual(send.call_count, 1)
+
+    def test_send_daily_alert_payload_does_not_fallback_from_text_primary(self):
+        primary_payload = {"msg_type": "text", "content": {"text": "primary"}}
+        fallback_payload = {"msg_type": "text", "content": {"text": "fallback"}}
+
+        with patch("monitor.send_feishu_payload", side_effect=monitor.MonitorError("text rejected")) as send:
+            with self.assertRaisesRegex(monitor.MonitorError, "text rejected"):
+                monitor.send_daily_alert_payload(primary_payload, fallback_payload, "https://example.com")
+
+        self.assertEqual(send.call_count, 1)
 
     def test_feishu_business_error_is_not_treated_as_delivery(self):
         with patch("monitor.http_json", return_value={"StatusCode": 19022, "StatusMessage": "webhook expired"}):
             with self.assertRaisesRegex(monitor.MonitorError, "Feishu response 19022: webhook expired"):
                 monitor.send_feishu("hello", "https://example.com")
+
+    def test_send_feishu_payload_raises_on_business_error(self):
+        payload = {"msg_type": "interactive", "card": {"elements": []}}
+
+        with patch("monitor.http_json", return_value={"StatusCode": 19022, "StatusMessage": "webhook expired"}):
+            with self.assertRaisesRegex(monitor.MonitorError, "Feishu response 19022: webhook expired"):
+                monitor.send_feishu_payload(payload, "https://example.com")
 
     def test_encrypted_state_round_trips(self):
         key = base64.urlsafe_b64encode(os.urandom(32)).decode()
