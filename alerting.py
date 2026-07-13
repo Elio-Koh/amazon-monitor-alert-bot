@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any, Mapping, Optional
+import re
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 
+ASIN_RE = r"[A-Z0-9]{10}"
 SEVERITY_ORDER = {"P0": 0, "P1": 1, "P2": 2}
 
 
@@ -101,3 +103,213 @@ class ChangeEvent:
             "" if self.after is None else str(self.after),
         ]
         return "|".join(parts)
+
+
+def _text(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def _as_float(value: Any) -> Optional[float]:
+    try:
+        parsed = float(_text(value))
+    except ValueError:
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _as_int(value: Any) -> Optional[int]:
+    parsed = _as_float(value)
+    return None if parsed is None else int(parsed)
+
+
+def _is_empty(value: Any) -> bool:
+    return _text(value) in {"", "-", "None", "null", "无"}
+
+
+def _display(value: Any) -> str:
+    return "无" if _is_empty(value) else _text(value)
+
+
+def _pct_change(before: Any, after: Any) -> float:
+    before_value = _as_float(before)
+    after_value = _as_float(after)
+    if before_value is None or after_value is None or before_value == 0:
+        return 0.0
+    return abs(after_value - before_value) / abs(before_value) * 100.0
+
+
+def _parent_memberships(snapshot: Mapping[str, Any]) -> Dict[str, str]:
+    memberships: Dict[str, str] = {}
+    for parent_asin, parent in snapshot.get("parents", {}).items():
+        if not isinstance(parent, Mapping):
+            continue
+        for child_asin in parent.get("child_asins", []) or []:
+            memberships[str(child_asin)] = str(parent_asin)
+        for child_asin in parent.get("inventory_only_asins", []) or []:
+            memberships[str(child_asin)] = str(parent_asin)
+    return memberships
+
+
+def _event(
+    severity: str,
+    category: str,
+    parent_asin: Optional[str],
+    child_asin: Optional[str],
+    field: str,
+    before: Any,
+    after: Any,
+    title: str,
+    detail: str,
+    action: str,
+    raw: str,
+) -> ChangeEvent:
+    return ChangeEvent(
+        severity=severity,
+        category=category,
+        parent_asin=parent_asin,
+        child_asin=child_asin,
+        field=field,
+        before=before,
+        after=after,
+        title=title,
+        detail=detail,
+        action=action,
+        raw=raw,
+    )
+
+
+def _classify_child_field(
+    child_asin: str,
+    parent_asin: Optional[str],
+    field: str,
+    before: Any,
+    after: Any,
+    raw: str,
+    config: AlertConfig,
+) -> ChangeEvent:
+    if field == "inventory":
+        inventory = _as_int(after)
+        detail = f"库存：{_display(before)} -> {_display(after)}"
+        if inventory == 0:
+            return _event("P0", "inventory", parent_asin, child_asin, field, before, after, f"{child_asin} 库存归零", detail, "检查补货、广告预算和前台可售状态", raw)
+        if inventory is not None and inventory > 0 and inventory <= config.low_inventory_threshold:
+            return _event("P1", "inventory", parent_asin, child_asin, field, before, after, f"{child_asin} 低库存", detail, "确认补货节奏和广告消耗", raw)
+        return _event("P2", "inventory", parent_asin, child_asin, field, before, after, f"{child_asin} 库存变化", detail, "确认库存变化是否符合预期", raw)
+
+    if field in {"coupon", "promotion"}:
+        label = "Coupon" if field == "coupon" else "促销/Deal"
+        before_empty = _is_empty(before)
+        after_empty = _is_empty(after)
+        if before_empty and not after_empty:
+            severity = "P0"
+            title = f"{child_asin} {label}开始"
+        elif not before_empty and after_empty:
+            severity = "P0"
+            title = f"{child_asin} {label}结束"
+        else:
+            severity = "P1" if not before_empty and not after_empty else "P0"
+            title = f"{child_asin} {label}变化"
+        detail = f"{label}：{_display(before)} -> {_display(after)}"
+        return _event(severity, "promotion", parent_asin, child_asin, field, before, after, title, detail, "检查广告预算、价格竞争力和促销排期", raw)
+
+    if field == "price":
+        before_price = _as_float(before)
+        after_price = _as_float(after)
+        abs_change = abs((after_price or 0.0) - (before_price or 0.0))
+        pct_change = _pct_change(before, after)
+        if pct_change >= config.critical_price_pct_threshold:
+            severity = "P0"
+        elif abs_change >= config.price_abs_threshold and pct_change >= config.price_pct_threshold:
+            severity = "P1"
+        else:
+            severity = "P2"
+        detail = f"价格：{_display(before)} -> {_display(after)}"
+        return _event(severity, "price", parent_asin, child_asin, field, before, after, f"{child_asin} 价格变化", detail, "检查竞品价格、广告 ACOS 和预算", raw)
+
+    if field == "delivery_promise":
+        detail = f"配送时效：{_display(before)} -> {_display(after)}"
+        return _event("P1", "delivery", parent_asin, child_asin, field, before, after, f"{child_asin} 配送时效变化", detail, "检查库存、配送方式和转化率影响", raw)
+
+    detail = f"{field}：{_display(before)} -> {_display(after)}"
+    return _event("P2", field, parent_asin, child_asin, field, before, after, f"{child_asin} {field}变化", detail, "确认变化是否符合预期", raw)
+
+
+def _classify_parent_field(parent_asin: str, field: str, before: Any, after: Any, raw: str, config: AlertConfig) -> ChangeEvent:
+    detail = f"{field}：{_display(before)} -> {_display(after)}"
+    if field in {"major_rank", "minor_rank"}:
+        severity = "P1" if _pct_change(before, after) >= config.rank_pct_threshold else "P2"
+        return _event(severity, "rank", parent_asin, None, field, before, after, f"{parent_asin} 排名变化", detail, "检查排名变化和流量影响", raw)
+    if field in {"stars", "rating_count"}:
+        return _event("P2", "parent_metric", parent_asin, None, field, before, after, f"{parent_asin} 评分指标变化", detail, "确认评论指标变化", raw)
+    return _event("P2", "parent", parent_asin, None, field, before, after, f"{parent_asin} {field}变化", detail, "确认父体变化是否符合预期", raw)
+
+
+def _classify_error(raw: str, parent_asin: Optional[str] = None) -> ChangeEvent:
+    severity = "P0" if "前台数据缺失" in raw or "parent failed" in raw.lower() else "P1"
+    title = f"{parent_asin or '数据源'} 异常"
+    return _event(severity, "data_source", parent_asin, None, "error", None, None, title, raw, "确认采集源是否影响今日判断", raw)
+
+
+def build_change_events(
+    previous: Mapping[str, Any],
+    current: Mapping[str, Any],
+    changes: Iterable[str],
+    config: AlertConfig,
+) -> List[ChangeEvent]:
+    previous_memberships = _parent_memberships(previous)
+    current_memberships = _parent_memberships(current)
+    events: List[ChangeEvent] = []
+
+    parent_field_re = re.compile(rf"^({ASIN_RE}) parent ([a-z_]+): (.*) -> (.*)$")
+    child_field_re = re.compile(rf"^({ASIN_RE}) child ([a-z_]+): (.*) -> (.*)$")
+    child_relation_re = re.compile(rf"^({ASIN_RE}) child (added|removed): ({ASIN_RE})$")
+    inventory_only_re = re.compile(rf"^({ASIN_RE}) inventory-only child (added|removed): ({ASIN_RE})$")
+
+    for raw in changes:
+        raw_text = str(raw)
+        match = parent_field_re.match(raw_text)
+        if match:
+            parent_asin, field, before, after = match.groups()
+            events.append(_classify_parent_field(parent_asin, field, before, after, raw_text, config))
+            continue
+
+        match = child_field_re.match(raw_text)
+        if match:
+            child_asin, field, before, after = match.groups()
+            parent_asin = current_memberships.get(child_asin) or previous_memberships.get(child_asin)
+            events.append(_classify_child_field(child_asin, parent_asin, field, before, after, raw_text, config))
+            continue
+
+        match = child_relation_re.match(raw_text)
+        if match:
+            parent_asin, relation, child_asin = match.groups()
+            title = f"{child_asin} 子体新增" if relation == "added" else f"{child_asin} 子体移除"
+            severity = "P1" if relation == "added" else "P0"
+            verb = "新增" if relation == "added" else "移除"
+            detail = f"父体 {parent_asin} {verb}子体 {child_asin}"
+            events.append(_event(severity, "availability", parent_asin, child_asin, "child", None, relation, title, detail, "检查前台可售状态和变体关系", raw_text))
+            continue
+
+        match = inventory_only_re.match(raw_text)
+        if match:
+            parent_asin, relation, child_asin = match.groups()
+            title = f"{child_asin} inventory-only新增" if relation == "added" else f"{child_asin} inventory-only移除"
+            severity = "P0" if relation == "added" else "P1"
+            verb = "新增" if relation == "added" else "移除"
+            detail = f"父体 {parent_asin} 库存侧异常子体 {child_asin} {verb}"
+            events.append(_event(severity, "availability", parent_asin, child_asin, "inventory_only", None, relation, title, detail, "检查前台可售状态和变体关系", raw_text))
+            continue
+
+        parent_match = re.search(rf"({ASIN_RE})", raw_text)
+        events.append(_classify_error(raw_text, parent_match.group(1) if parent_match else None))
+
+    return sorted(
+        events,
+        key=lambda event: (
+            SEVERITY_ORDER.get(event.severity, 99),
+            event.parent_asin or "",
+            event.child_asin or "",
+            event.category,
+            event.field,
+        ),
+    )
