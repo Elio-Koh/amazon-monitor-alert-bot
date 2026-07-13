@@ -190,7 +190,7 @@ class AlertingTest(unittest.TestCase):
         self.assertNotIn("CHILD00002 库存归零", summary)
         self.assertIn("... 还有 1 项同级重点事项，见完整报告", summary)
 
-    def test_render_text_summary_row_includes_parent_detail_and_action_lines(self):
+    def test_render_text_summary_row_includes_parent_detail_without_action_lines(self):
         events = [
             alerting.ChangeEvent("P1", "price", "PARENT1234", "CHILD00002", "price", "20.0", "21.2", "CHILD00002 价格变化", "价格：20.0 -> 21.2", "检查竞品价格、广告 ACOS 和预算", "raw2"),
         ]
@@ -199,7 +199,7 @@ class AlertingTest(unittest.TestCase):
 
         self.assertIn("1. CHILD00002 价格变化｜父体 PARENT1234", summary)
         self.assertIn("   价格：20.0 -> 21.2", summary)
-        self.assertIn("   建议：检查竞品价格、广告 ACOS 和预算", summary)
+        self.assertNotIn("建议：", summary)
 
     def test_apply_dedupe_suppresses_same_event_within_window(self):
         event = alerting.ChangeEvent(
@@ -529,7 +529,7 @@ class AlertingTest(unittest.TestCase):
         )
 
         self.assertEqual(events[0].severity, "P1")
-        self.assertEqual(events[0].detail, "配送时效：Tomorrow -> Friday, July 17")
+        self.assertEqual(events[0].detail, "配送时效：1天 -> 4天（+3天）")
 
     def test_build_change_events_classifies_small_or_faster_delivery_change_as_p2(self):
         events = alerting.build_change_events(

@@ -134,7 +134,6 @@ def _section_lines(title: str, events: List[ChangeEvent], limit: int) -> List[st
             [
                 f"{index}. {event.title}{parent_suffix}",
                 f"   {event.detail}",
-                f"   建议：{event.action}",
             ]
         )
     hidden = len(events) - len(visible)
@@ -306,6 +305,16 @@ def _delivery_days(value: Any, captured_at: Any) -> Optional[int]:
     return (target - base_date.weekday()) % 7
 
 
+def _delivery_detail(before: Any, after: Any, captured_at: Any) -> str:
+    before_days = _delivery_days(before, captured_at)
+    after_days = _delivery_days(after, captured_at)
+    if before_days is None or after_days is None:
+        return "配送时效：天数变化无法解析"
+    delta = after_days - before_days
+    delta_text = f"+{delta}天" if delta > 0 else f"{delta}天" if delta < 0 else "无变化"
+    return f"配送时效：{before_days}天 -> {after_days}天（{delta_text}）"
+
+
 def _parent_memberships(snapshot: Mapping[str, Any]) -> Dict[str, str]:
     memberships: Dict[str, str] = {}
     for parent_asin, parent in snapshot.get("parents", {}).items():
@@ -396,13 +405,13 @@ def _classify_child_field(
         return _event(severity, "price", parent_asin, child_asin, field, before, after, f"{child_asin} 价格变化", detail, "检查竞品价格、广告 ACOS 和预算", raw)
 
     if field == "delivery_promise":
-        detail = f"配送时效：{_display(before)} -> {_display(after)}"
         before_days = _delivery_days(before, captured_at)
         after_days = _delivery_days(after, captured_at)
         if before_days is not None and after_days is not None:
             severity = "P1" if after_days - before_days >= config.delivery_days_threshold else "P2"
         else:
             severity = "P2"
+        detail = _delivery_detail(before, after, captured_at)
         return _event(severity, "delivery", parent_asin, child_asin, field, before, after, f"{child_asin} 配送时效变化", detail, "检查库存、配送方式和转化率影响", raw)
 
     detail = f"{field}：{_display(before)} -> {_display(after)}"
