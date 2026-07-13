@@ -954,20 +954,25 @@ def diff_snapshots(previous: Optional[Mapping[str, Any]], current: Mapping[str, 
         for field in PARENT_FIELDS:
             if field_changed(prev.get(field), cur.get(field)):
                 changes.append(f"{asin} parent {field}: {prev.get(field)} -> {cur.get(field)}")
-        prev_live_children = set(prev.get("child_asins") or [])
-        cur_live_children = set(cur.get("child_asins") or [])
-        for child_asin in sorted(cur_live_children - prev_live_children):
-            changes.append(f"{asin} child added: {child_asin}")
-        for child_asin in sorted(prev_live_children - cur_live_children):
-            changes.append(f"{asin} child removed: {child_asin}")
         prev_inventory_only = set(prev.get("inventory_only_asins") or [])
         cur_inventory_only = set(cur.get("inventory_only_asins") or [])
-        for child_asin in sorted(cur_inventory_only - prev_inventory_only):
+        prev_live_children = set(prev.get("child_asins") or [])
+        cur_live_children = set(cur.get("child_asins") or [])
+        prev_known_children = prev_live_children | prev_inventory_only
+        cur_known_children = cur_live_children | cur_inventory_only
+        for child_asin in sorted(cur_known_children - prev_known_children):
+            if child_asin in cur_live_children:
+                changes.append(f"{asin} child added: {child_asin}")
+            elif parse_int((cur_children.get(child_asin) or {}).get("inventory")):
+                changes.append(f"{asin} inventory-only child added: {child_asin}")
+        for child_asin in sorted(prev_known_children - cur_known_children):
+            if child_asin in prev_live_children:
+                changes.append(f"{asin} child removed: {child_asin}")
+            elif parse_int((prev_children.get(child_asin) or {}).get("inventory")):
+                changes.append(f"{asin} inventory-only child removed: {child_asin}")
+        for child_asin in sorted((cur_inventory_only - prev_inventory_only) & prev_known_children):
             if parse_int((cur_children.get(child_asin) or {}).get("inventory")):
                 changes.append(f"{asin} inventory-only child added: {child_asin}")
-        for child_asin in sorted(prev_inventory_only - cur_inventory_only):
-            if parse_int((prev_children.get(child_asin) or {}).get("inventory")):
-                changes.append(f"{asin} inventory-only child removed: {child_asin}")
     for asin in sorted(set(prev_children) & set(cur_children)):
         prev = prev_children.get(asin, {})
         cur = cur_children.get(asin, {})
