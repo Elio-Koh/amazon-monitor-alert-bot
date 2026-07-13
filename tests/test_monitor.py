@@ -234,6 +234,23 @@ class MonitorTest(unittest.TestCase):
 
         self.assertEqual(changes, [])
 
+    def test_diff_reports_inventory_only_child_disappearance_as_child_removed(self):
+        previous = {
+            "parents": {"PARENT1234": {"child_asins": [], "inventory_only_asins": ["CHILD00001"]}},
+            "children": {"CHILD00001": {"inventory": 8, "front_status": "不可售/404"}},
+            "errors": [],
+        }
+        current = {
+            "parents": {"PARENT1234": {"child_asins": [], "inventory_only_asins": []}},
+            "children": {},
+            "errors": [],
+        }
+
+        changes = monitor.diff_snapshots(previous, current)
+
+        self.assertIn("PARENT1234 child removed: CHILD00001", changes)
+        self.assertNotIn("PARENT1234 inventory-only child removed: CHILD00001", changes)
+
     def test_merge_snapshot_preserves_unknown_current_fields_and_keeps_real_empty_values(self):
         previous = {
             "captured_at": "2026-07-09T01:15:00Z",
