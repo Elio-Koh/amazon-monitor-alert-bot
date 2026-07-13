@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 import math
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
 ASIN_RE = r"[A-Z0-9]{10}"
@@ -103,6 +104,73 @@ class ChangeEvent:
             "" if self.after is None else str(self.after),
         ]
         return "|".join(parts)
+
+
+def filter_events(events: Iterable[ChangeEvent], config: AlertConfig) -> List[ChangeEvent]:
+    max_order = SEVERITY_ORDER.get(config.min_severity, SEVERITY_ORDER["P1"])
+    return [event for event in events if SEVERITY_ORDER.get(event.severity, 99) <= max_order]
+
+
+def _event_date(captured_at: str) -> date:
+    try:
+        parsed = datetime.fromisoformat(str(captured_at).replace("Z", "+00:00"))
+    except ValueError:
+        parsed = datetime.now(timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone(timedelta(hours=8))).date()
+
+
+def _parse_date(value: Any) -> Optional[date]:
+    try:
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def apply_dedupe(
+    events: Iterable[ChangeEvent],
+    history: Mapping[str, Mapping[str, Any]],
+    captured_at: str,
+    config: AlertConfig,
+) -> Tuple[List[ChangeEvent], Dict[str, Dict[str, str]]]:
+    current_day = _event_date(captured_at)
+    keep_days = max(config.dedupe_window_days, 1)
+    updated: Dict[str, Dict[str, str]] = {}
+
+    for key, value in history.items():
+        if not isinstance(value, Mapping):
+            continue
+        last_seen = _parse_date(value.get("last_seen_on"))
+        last_sent = _parse_date(value.get("last_sent_on"))
+        last_seen_delta = (current_day - last_seen).days if last_seen is not None else None
+        last_sent_delta = (current_day - last_sent).days if last_sent is not None else None
+        recent_last_seen = last_seen is not None and last_seen_delta is not None and 0 <= last_seen_delta <= keep_days
+        recent_last_sent = last_sent is not None and last_sent_delta is not None and 0 <= last_sent_delta <= keep_days
+        if recent_last_seen or recent_last_sent:
+            last_sent_value = str(last_sent) if recent_last_sent else str(value.get("last_sent_on", "")) if last_sent is None else ""
+            updated[str(key)] = {
+                "last_seen_on": str(last_seen) if recent_last_seen else "",
+                "last_sent_on": last_sent_value,
+                "severity": str(value.get("severity", "")),
+            }
+
+    fresh: List[ChangeEvent] = []
+    for event in events:
+        key = event.dedupe_key()
+        prior = updated.get(key)
+        last_sent = _parse_date(prior.get("last_sent_on")) if prior else None
+        sent_delta = (current_day - last_sent).days if last_sent is not None else None
+        suppress = sent_delta is not None and 0 <= sent_delta <= config.dedupe_window_days
+        if not suppress:
+            fresh.append(event)
+        updated[key] = {
+            "last_seen_on": str(current_day),
+            "last_sent_on": str(last_sent if suppress and last_sent else current_day),
+            "severity": event.severity,
+        }
+
+    return fresh, updated
 
 
 def _text(value: Any) -> str:

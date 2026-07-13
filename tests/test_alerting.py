@@ -112,6 +112,179 @@ class AlertingTest(unittest.TestCase):
 
         self.assertEqual(event.dedupe_key(), "P1|price|||price||")
 
+    def test_filter_events_keeps_only_min_severity_and_hides_p2(self):
+        events = [
+            alerting.ChangeEvent("P0", "inventory", "PARENT1234", "CHILD00001", "inventory", 1, 0, "p0", "detail", "act", "raw1"),
+            alerting.ChangeEvent("P1", "price", "PARENT1234", "CHILD00002", "price", 10, 11, "p1", "detail", "act", "raw2"),
+            alerting.ChangeEvent("P2", "rating_count", "PARENT1234", None, "rating_count", 1, 2, "p2", "detail", "act", "raw3"),
+        ]
+
+        filtered = alerting.filter_events(events, alerting.AlertConfig(min_severity="P1"))
+
+        self.assertEqual([event.title for event in filtered], ["p0", "p1"])
+
+    def test_apply_dedupe_suppresses_same_event_within_window(self):
+        event = alerting.ChangeEvent(
+            "P1",
+            "price",
+            "PARENT1234",
+            "CHILD00001",
+            "price",
+            "20.0",
+            "21.5",
+            "CHILD00001 价格变化",
+            "价格：20.0 -> 21.5",
+            "检查竞品价格、广告 ACOS 和预算",
+            "CHILD00001 child price: 20.0 -> 21.5",
+        )
+        history = {event.dedupe_key(): {"last_sent_on": "2026-07-13", "severity": "P1"}}
+
+        fresh, updated = alerting.apply_dedupe(
+            [event],
+            history,
+            "2026-07-13T01:15:00Z",
+            alerting.AlertConfig(dedupe_window_days=1),
+        )
+
+        self.assertEqual(fresh, [])
+        self.assertEqual(updated[event.dedupe_key()]["last_seen_on"], "2026-07-13")
+
+    def test_apply_dedupe_allows_event_after_window(self):
+        event = alerting.ChangeEvent(
+            "P1",
+            "price",
+            "PARENT1234",
+            "CHILD00001",
+            "price",
+            "20.0",
+            "21.5",
+            "CHILD00001 价格变化",
+            "价格：20.0 -> 21.5",
+            "检查竞品价格、广告 ACOS 和预算",
+            "CHILD00001 child price: 20.0 -> 21.5",
+        )
+        history = {event.dedupe_key(): {"last_sent_on": "2026-07-11", "severity": "P1"}}
+
+        fresh, updated = alerting.apply_dedupe(
+            [event],
+            history,
+            "2026-07-13T01:15:00Z",
+            alerting.AlertConfig(dedupe_window_days=1),
+        )
+
+        self.assertEqual(fresh, [event])
+        self.assertEqual(updated[event.dedupe_key()]["last_sent_on"], "2026-07-13")
+
+    def test_apply_dedupe_does_not_suppress_history_with_only_last_seen(self):
+        event = alerting.ChangeEvent(
+            "P1",
+            "price",
+            "PARENT1234",
+            "CHILD00001",
+            "price",
+            "20.0",
+            "21.5",
+            "CHILD00001 价格变化",
+            "价格：20.0 -> 21.5",
+            "检查竞品价格、广告 ACOS 和预算",
+            "CHILD00001 child price: 20.0 -> 21.5",
+        )
+        history = {event.dedupe_key(): {"last_seen_on": "2026-07-13", "severity": "P1"}}
+
+        fresh, updated = alerting.apply_dedupe(
+            [event],
+            history,
+            "2026-07-13T01:15:00Z",
+            alerting.AlertConfig(dedupe_window_days=1),
+        )
+
+        self.assertEqual(fresh, [event])
+        self.assertEqual(updated[event.dedupe_key()]["last_seen_on"], "2026-07-13")
+        self.assertEqual(updated[event.dedupe_key()]["last_sent_on"], "2026-07-13")
+
+    def test_apply_dedupe_does_not_suppress_or_keep_future_last_sent(self):
+        event = alerting.ChangeEvent(
+            "P1",
+            "price",
+            "PARENT1234",
+            "CHILD00001",
+            "price",
+            "20.0",
+            "21.5",
+            "CHILD00001 价格变化",
+            "价格：20.0 -> 21.5",
+            "检查竞品价格、广告 ACOS 和预算",
+            "CHILD00001 child price: 20.0 -> 21.5",
+        )
+        history = {event.dedupe_key(): {"last_sent_on": "2026-07-14", "severity": "P1"}}
+
+        fresh, updated = alerting.apply_dedupe(
+            [event],
+            history,
+            "2026-07-13T01:15:00Z",
+            alerting.AlertConfig(dedupe_window_days=1),
+        )
+
+        self.assertEqual(fresh, [event])
+        self.assertEqual(updated[event.dedupe_key()]["last_sent_on"], "2026-07-13")
+
+    def test_apply_dedupe_zero_day_window_suppresses_same_beijing_day_only(self):
+        event = alerting.ChangeEvent(
+            "P1",
+            "price",
+            "PARENT1234",
+            "CHILD00001",
+            "price",
+            "20.0",
+            "21.5",
+            "CHILD00001 价格变化",
+            "价格：20.0 -> 21.5",
+            "检查竞品价格、广告 ACOS 和预算",
+            "CHILD00001 child price: 20.0 -> 21.5",
+        )
+
+        same_day_fresh, _ = alerting.apply_dedupe(
+            [event],
+            {event.dedupe_key(): {"last_sent_on": "2026-07-13", "severity": "P1"}},
+            "2026-07-13T01:15:00Z",
+            alerting.AlertConfig(dedupe_window_days=0),
+        )
+        previous_day_fresh, _ = alerting.apply_dedupe(
+            [event],
+            {event.dedupe_key(): {"last_sent_on": "2026-07-12", "severity": "P1"}},
+            "2026-07-13T01:15:00Z",
+            alerting.AlertConfig(dedupe_window_days=0),
+        )
+
+        self.assertEqual(same_day_fresh, [])
+        self.assertEqual(previous_day_fresh, [event])
+
+    def test_apply_dedupe_uses_beijing_day_for_rollover_updates(self):
+        event = alerting.ChangeEvent(
+            "P1",
+            "price",
+            "PARENT1234",
+            "CHILD00001",
+            "price",
+            "20.0",
+            "21.5",
+            "CHILD00001 价格变化",
+            "价格：20.0 -> 21.5",
+            "检查竞品价格、广告 ACOS 和预算",
+            "CHILD00001 child price: 20.0 -> 21.5",
+        )
+
+        fresh, updated = alerting.apply_dedupe(
+            [event],
+            {},
+            "2026-07-12T16:15:00Z",
+            alerting.AlertConfig(dedupe_window_days=1),
+        )
+
+        self.assertEqual(fresh, [event])
+        self.assertEqual(updated[event.dedupe_key()]["last_seen_on"], "2026-07-13")
+        self.assertEqual(updated[event.dedupe_key()]["last_sent_on"], "2026-07-13")
+
     def test_build_change_events_classifies_promotion_loss_as_p0(self):
         previous = {
             "parents": {"PARENT1234": {"child_asins": ["CHILD00001"]}},
