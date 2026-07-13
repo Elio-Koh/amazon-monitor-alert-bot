@@ -111,6 +111,58 @@ def filter_events(events: Iterable[ChangeEvent], config: AlertConfig) -> List[Ch
     return [event for event in events if SEVERITY_ORDER.get(event.severity, 99) <= max_order]
 
 
+def format_report_time(value: Any) -> str:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        parsed = datetime.now(timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    beijing = parsed.astimezone(timezone(timedelta(hours=8)))
+    return f"北京时间 {beijing:%Y-%m-%d %H:%M:%S}"
+
+
+def _section_lines(title: str, events: List[ChangeEvent], limit: int) -> List[str]:
+    if not events:
+        return []
+
+    lines = ["", title]
+    for index, event in enumerate(events[:limit], start=1):
+        parent_suffix = f"｜父体 {event.parent_asin}" if event.parent_asin else ""
+        lines.extend(
+            [
+                f"{index}. {event.title}{parent_suffix}",
+                f"   {event.detail}",
+                f"   建议：{event.action}",
+            ]
+        )
+    hidden = len(events) - limit
+    if hidden > 0:
+        lines.append(f"... 还有 {hidden} 项同级重点事项，见完整报告")
+    return lines
+
+
+def render_text_summary(events: Iterable[ChangeEvent], captured_at: str, config: AlertConfig) -> str:
+    filtered = filter_events(events, config)
+    p0 = [event for event in filtered if event.severity == "P0"]
+    p1 = [event for event in filtered if event.severity == "P1"]
+
+    if not p0 and not p1 and not config.send_no_change:
+        return ""
+
+    lines = [
+        f"ASIN 每日重点提醒｜{format_report_time(captured_at)}",
+        f"今日结论：P0 {len(p0)} 项｜P1 {len(p1)} 项",
+    ]
+    lines.extend(_section_lines("P0 必看：", p0, config.max_summary_items))
+    remaining = max(0, config.max_summary_items - min(len(p0), config.max_summary_items))
+    p1_limit = remaining if remaining > 0 else config.max_summary_items
+    lines.extend(_section_lines("P1 复核：", p1, p1_limit))
+    if config.full_report_url:
+        lines.extend(["", f"完整报告：{config.full_report_url}"])
+    return "\n".join(lines)
+
+
 def _event_date(captured_at: str) -> date:
     try:
         parsed = datetime.fromisoformat(str(captured_at).replace("Z", "+00:00"))
