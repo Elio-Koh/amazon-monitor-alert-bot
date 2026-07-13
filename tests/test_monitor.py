@@ -10,6 +10,76 @@ import monitor
 
 
 class MonitorTest(unittest.TestCase):
+    def _daily_config(self, key, **overrides):
+        config = {
+            "PANGOLINFO_API_TOKEN": "token",
+            "FEISHU_WEBHOOK_URL": "https://example.com",
+            "MONITOR_PARENT_ASINS": "PARENT1234",
+            "STATE_ENCRYPTION_KEY": key,
+            "XINGSHANG_MCP_URL_TEMPLATE": "https://example.com/{parent_asin}",
+            "FEISHU_WEBHOOK_SECRET": "secret",
+            "MARKETPLACE": "US",
+            "PANGOLIN_ZIPCODE": "10041",
+        }
+        config.update(overrides)
+        return config
+
+    def _daily_previous_snapshot(self, **overrides):
+        snapshot = {
+            "captured_at": "2026-07-09T01:15:00Z",
+            "parents": {
+                "PARENT1234": {
+                    "major_rank": 100,
+                    "minor_rank": 20,
+                    "stars": 4.5,
+                    "rating_count": 100,
+                    "child_asins": ["CHILD00001"],
+                    "source": "pangolin",
+                }
+            },
+            "children": {
+                "CHILD00001": {
+                    "price": 20.0,
+                    "coupon": "",
+                    "promotion": "",
+                    "inventory": 10,
+                    "delivery_promise": "Wednesday, July 15",
+                    "source": "pangolin",
+                }
+            },
+            "errors": [],
+        }
+        snapshot.update(overrides)
+        return snapshot
+
+    def _daily_current_snapshot(self, **overrides):
+        snapshot = {
+            "captured_at": "2026-07-10T01:15:00Z",
+            "parents": {
+                "PARENT1234": {
+                    "major_rank": 130,
+                    "minor_rank": 20,
+                    "stars": 4.5,
+                    "rating_count": 100,
+                    "child_asins": ["CHILD00001"],
+                    "source": "pangolin",
+                }
+            },
+            "children": {
+                "CHILD00001": {
+                    "price": 23.0,
+                    "coupon": "",
+                    "promotion": "",
+                    "inventory": 0,
+                    "delivery_promise": "Wednesday, July 15",
+                    "source": "pangolin",
+                }
+            },
+            "errors": [],
+        }
+        snapshot.update(overrides)
+        return snapshot
+
     def test_normalizes_sources_into_parent_and_children_snapshot(self):
         parent_detail = {
             "asin": "PARENT1234",
@@ -457,7 +527,7 @@ class MonitorTest(unittest.TestCase):
             monitor.save_current(state_path, previous, key)
             with patch("monitor.env_config", return_value={"STATE_ENCRYPTION_KEY": key, "FEISHU_WEBHOOK_URL": "https://example.com"}), patch(
                 "monitor.now_iso", return_value="2026-07-10T01:15:00Z"
-            ), patch("monitor.collect_snapshot", return_value=current), patch("monitor.send_feishu") as send:
+            ), patch("monitor.collect_snapshot", return_value=current), patch("monitor.send_daily_alert_payload") as send:
                 result = monitor.main(
                     ["--daily-report", "--state", state_path, "--output", state_path, "--delivery-state", delivery_path]
                 )
@@ -474,20 +544,252 @@ class MonitorTest(unittest.TestCase):
 
     def test_daily_report_does_not_record_delivery_when_feishu_fails(self):
         key = base64.urlsafe_b64encode(os.urandom(32)).decode()
-        previous = {"captured_at": "2026-07-09T01:15:00Z", "parents": {}, "children": {}, "errors": []}
-        current = {"captured_at": "2026-07-10T01:15:00Z", "parents": {}, "children": {}, "errors": []}
+        previous = self._daily_previous_snapshot()
+        current = self._daily_current_snapshot()
         with tempfile.TemporaryDirectory() as directory:
             state_path = os.path.join(directory, "latest.enc.json")
             delivery_path = os.path.join(directory, "delivery.enc.json")
             monitor.save_current(state_path, previous, key)
             with patch("monitor.env_config", return_value={"STATE_ENCRYPTION_KEY": key, "FEISHU_WEBHOOK_URL": "https://example.com"}), patch(
                 "monitor.now_iso", return_value="2026-07-10T01:15:00Z"
-            ), patch("monitor.collect_snapshot", return_value=current), patch("monitor.send_feishu", side_effect=monitor.MonitorError("Feishu failed")):
+            ), patch("monitor.collect_snapshot", return_value=current), patch("monitor.send_daily_alert_payload", side_effect=monitor.MonitorError("Feishu failed")):
                 with self.assertRaises(monitor.MonitorError):
                     monitor.main(
                         ["--daily-report", "--state", state_path, "--output", state_path, "--delivery-state", delivery_path]
                     )
 
+            self.assertFalse(os.path.exists(delivery_path))
+
+    def test_daily_report_sends_one_interactive_alert_card_with_text_fallback(self):
+        key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+        previous = self._daily_previous_snapshot()
+        current = self._daily_current_snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "latest.enc.json")
+            delivery_path = os.path.join(directory, "delivery.enc.json")
+            monitor.save_current(state_path, previous, key)
+
+            with (
+                patch("monitor.env_config", return_value=self._daily_config(key)),
+                patch("monitor.now_iso", return_value="2026-07-10T01:15:00Z"),
+                patch("monitor.collect_snapshot", return_value=current),
+                patch("monitor.send_daily_alert_payload") as send_daily,
+                patch("monitor.send_feishu") as send_old,
+            ):
+                result = monitor.main(["--daily-report", "--state", state_path, "--output", state_path, "--delivery-state", delivery_path])
+
+            self.assertEqual(result, 0)
+            send_old.assert_not_called()
+            send_daily.assert_called_once()
+            primary, fallback, webhook = send_daily.call_args.args
+            self.assertEqual(webhook, "https://example.com")
+            self.assertEqual(primary["msg_type"], "interactive")
+            self.assertEqual(primary["card"]["header"]["title"]["content"], "ASIN 每日重点提醒")
+            self.assertEqual(fallback["msg_type"], "text")
+            self.assertIn("库存归零", fallback["content"]["text"])
+            self.assertEqual(monitor.load_delivery_date(delivery_path, key), "2026-07-10")
+
+    def test_full_report_output_writes_original_daily_report_without_sending_it(self):
+        key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+        previous = self._daily_previous_snapshot()
+        current = self._daily_current_snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "latest.enc.json")
+            delivery_path = os.path.join(directory, "delivery.enc.json")
+            full_report_path = os.path.join(directory, "reports", "daily.txt")
+            monitor.save_current(state_path, previous, key)
+
+            with (
+                patch("monitor.env_config", return_value=self._daily_config(key, FULL_REPORT_OUTPUT=full_report_path)),
+                patch("monitor.now_iso", return_value="2026-07-10T01:15:00Z"),
+                patch("monitor.collect_snapshot", return_value=current),
+                patch("monitor.send_daily_alert_payload") as send_daily,
+            ):
+                result = monitor.main(["--daily-report", "--state", state_path, "--output", state_path, "--delivery-state", delivery_path])
+
+            self.assertEqual(result, 0)
+            with open(full_report_path, "r", encoding="utf-8") as handle:
+                full_report = handle.read()
+            self.assertIn("监控范围：父 ASIN：1｜正常子体：1", full_report)
+            self.assertIn("父 ASIN PARENT1234", full_report)
+            summary = send_daily.call_args.args[1]["content"]["text"]
+            self.assertNotIn("监控范围", summary)
+
+    def test_daily_report_with_only_p2_events_saves_state_and_delivery_without_feishu(self):
+        key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+        previous = self._daily_previous_snapshot()
+        current = self._daily_current_snapshot(
+            parents={
+                "PARENT1234": {
+                    "major_rank": 110,
+                    "minor_rank": 20,
+                    "stars": 4.6,
+                    "rating_count": 101,
+                    "child_asins": ["CHILD00001"],
+                    "source": "pangolin",
+                }
+            },
+            children=previous["children"],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "latest.enc.json")
+            delivery_path = os.path.join(directory, "delivery.enc.json")
+            monitor.save_current(state_path, previous, key)
+
+            with (
+                patch("monitor.env_config", return_value=self._daily_config(key, ALERT_SEND_NO_CHANGE="false")),
+                patch("monitor.now_iso", return_value="2026-07-10T01:15:00Z"),
+                patch("monitor.collect_snapshot", return_value=current),
+                patch("monitor.send_daily_alert_payload") as send_daily,
+                patch("monitor.send_feishu") as send_old,
+            ):
+                result = monitor.main(["--daily-report", "--state", state_path, "--output", state_path, "--delivery-state", delivery_path])
+
+            self.assertEqual(result, 0)
+            send_daily.assert_not_called()
+            send_old.assert_not_called()
+            self.assertEqual(monitor.load_delivery_date(delivery_path, key), "2026-07-10")
+            saved = monitor.load_previous(state_path, key)
+            self.assertEqual(saved["parents"]["PARENT1234"]["stars"], 4.6)
+            self.assertEqual(saved["alert_dedupe"], {})
+
+    def test_daily_report_dedupe_suppresses_same_event_inside_window_and_persists_history(self):
+        key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+        previous = self._daily_previous_snapshot(
+            captured_at="2026-07-10T01:15:00Z",
+            alert_dedupe={
+                "P0|inventory|PARENT1234|CHILD00001|inventory|10|0": {
+                    "last_seen_on": "2026-07-10",
+                    "last_sent_on": "2026-07-10",
+                    "severity": "P0",
+                }
+            },
+        )
+        current = self._daily_current_snapshot(
+            captured_at="2026-07-11T01:15:00Z",
+            parents={
+                "PARENT1234": {
+                    "major_rank": 100,
+                    "minor_rank": 20,
+                    "stars": 4.5,
+                    "rating_count": 100,
+                    "child_asins": ["CHILD00001"],
+                    "source": "pangolin",
+                }
+            },
+            children={
+                "CHILD00001": {
+                    "price": 20.0,
+                    "coupon": "",
+                    "promotion": "",
+                    "inventory": 0,
+                    "delivery_promise": "Wednesday, July 15",
+                    "source": "pangolin",
+                }
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "latest.enc.json")
+            delivery_path = os.path.join(directory, "delivery.enc.json")
+            monitor.save_current(state_path, previous, key)
+
+            with (
+                patch("monitor.env_config", return_value=self._daily_config(key, ALERT_DEDUPE_WINDOW_DAYS="1")),
+                patch("monitor.now_iso", return_value="2026-07-11T01:15:00Z"),
+                patch("monitor.collect_snapshot", return_value=current),
+                patch("monitor.send_daily_alert_payload") as send_daily,
+            ):
+                result = monitor.main(["--daily-report", "--state", state_path, "--output", state_path, "--delivery-state", delivery_path])
+
+            self.assertEqual(result, 0)
+            send_daily.assert_not_called()
+            saved = monitor.load_previous(state_path, key)
+            self.assertIn("alert_dedupe", saved)
+            self.assertEqual(saved["alert_dedupe"]["P0|inventory|PARENT1234|CHILD00001|inventory|10|0"]["last_sent_on"], "2026-07-10")
+            self.assertEqual(saved["alert_dedupe"]["P0|inventory|PARENT1234|CHILD00001|inventory|10|0"]["last_seen_on"], "2026-07-11")
+
+    def test_daily_report_text_mode_sends_text_payload_without_card_fallback(self):
+        key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+        previous = self._daily_previous_snapshot()
+        current = self._daily_current_snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "latest.enc.json")
+            delivery_path = os.path.join(directory, "delivery.enc.json")
+            monitor.save_current(state_path, previous, key)
+
+            with (
+                patch("monitor.env_config", return_value=self._daily_config(key, FEISHU_MESSAGE_MODE="text")),
+                patch("monitor.now_iso", return_value="2026-07-10T01:15:00Z"),
+                patch("monitor.collect_snapshot", return_value=current),
+                patch("monitor.send_daily_alert_payload") as send_daily,
+            ):
+                result = monitor.main(["--daily-report", "--state", state_path, "--output", state_path, "--delivery-state", delivery_path])
+
+            self.assertEqual(result, 0)
+            send_daily.assert_called_once()
+            primary, fallback, _ = send_daily.call_args.args
+            self.assertEqual(primary["msg_type"], "text")
+            self.assertIsNone(fallback)
+            self.assertIn("库存归零", primary["content"]["text"])
+
+    def test_daily_report_dry_run_prints_single_feishu_payload_and_does_not_save_state_or_delivery(self):
+        key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+        previous = self._daily_previous_snapshot()
+        current = self._daily_current_snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "latest.enc.json")
+            delivery_path = os.path.join(directory, "delivery.enc.json")
+            full_report_path = os.path.join(directory, "reports", "daily.txt")
+            monitor.save_current(state_path, previous, key)
+            stdout = io.StringIO()
+
+            with (
+                patch("monitor.env_config", return_value=self._daily_config(key, FULL_REPORT_OUTPUT=full_report_path)),
+                patch("monitor.now_iso", return_value="2026-07-10T01:15:00Z"),
+                patch("monitor.collect_snapshot", return_value=current),
+                patch("monitor.send_daily_alert_payload") as send_daily,
+                patch("sys.stdout", stdout),
+            ):
+                result = monitor.main(["--daily-report", "--dry-run", "--state", state_path, "--output", state_path, "--delivery-state", delivery_path])
+
+            self.assertEqual(result, 0)
+            send_daily.assert_not_called()
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["msg_type"], "interactive")
+            self.assertIn("库存归零", payload["card"]["elements"][0]["text"]["content"])
+            self.assertNotIn("监控范围", stdout.getvalue())
+            with open(full_report_path, "r", encoding="utf-8") as handle:
+                self.assertIn("监控范围：父 ASIN：1｜正常子体：1", handle.read())
+            self.assertFalse(os.path.exists(delivery_path))
+            saved = monitor.load_previous(state_path, key)
+            self.assertEqual(saved["captured_at"], "2026-07-09T01:15:00Z")
+
+    def test_daily_report_does_not_record_delivery_when_state_save_fails_after_send(self):
+        key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+        previous = self._daily_previous_snapshot()
+        current = self._daily_current_snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "latest.enc.json")
+            delivery_path = os.path.join(directory, "delivery.enc.json")
+            monitor.save_current(state_path, previous, key)
+            original_save_current = monitor.save_current
+
+            def save_current_or_fail(path, snapshot, encryption_key):
+                if path == state_path:
+                    raise OSError("state write failed")
+                original_save_current(path, snapshot, encryption_key)
+
+            with (
+                patch("monitor.env_config", return_value=self._daily_config(key)),
+                patch("monitor.now_iso", return_value="2026-07-10T01:15:00Z"),
+                patch("monitor.collect_snapshot", return_value=current),
+                patch("monitor.send_daily_alert_payload") as send_daily,
+                patch("monitor.save_current", side_effect=save_current_or_fail),
+            ):
+                with self.assertRaisesRegex(OSError, "state write failed"):
+                    monitor.main(["--daily-report", "--state", state_path, "--output", state_path, "--delivery-state", delivery_path])
+
+            send_daily.assert_called_once()
             self.assertFalse(os.path.exists(delivery_path))
 
     def test_daily_report_and_current_report_are_mutually_exclusive(self):
