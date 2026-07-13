@@ -218,7 +218,7 @@ class MonitorTest(unittest.TestCase):
 
         self.assertEqual(changes, [])
 
-    def test_diff_reports_inventory_only_anomaly_without_child_removal_when_live_child_becomes_inventory_only(self):
+    def test_diff_ignores_live_child_becomes_inventory_only(self):
         previous = {
             "parents": {"PARENT1234": {"child_asins": ["CHILD00001"], "inventory_only_asins": []}},
             "children": {"CHILD00001": {"inventory": 8}},
@@ -232,8 +232,7 @@ class MonitorTest(unittest.TestCase):
 
         changes = monitor.diff_snapshots(previous, current)
 
-        self.assertNotIn("PARENT1234 child removed: CHILD00001", changes)
-        self.assertIn("PARENT1234 inventory-only child added: CHILD00001", changes)
+        self.assertEqual(changes, [])
 
     def test_merge_snapshot_preserves_unknown_current_fields_and_keeps_real_empty_values(self):
         previous = {

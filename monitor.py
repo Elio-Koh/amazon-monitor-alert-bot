@@ -970,9 +970,6 @@ def diff_snapshots(previous: Optional[Mapping[str, Any]], current: Mapping[str, 
                 changes.append(f"{asin} child removed: {child_asin}")
             elif parse_int((prev_children.get(child_asin) or {}).get("inventory")):
                 changes.append(f"{asin} inventory-only child removed: {child_asin}")
-        for child_asin in sorted((cur_inventory_only - prev_inventory_only) & prev_known_children):
-            if parse_int((cur_children.get(child_asin) or {}).get("inventory")):
-                changes.append(f"{asin} inventory-only child added: {child_asin}")
     for asin in sorted(set(prev_children) & set(cur_children)):
         prev = prev_children.get(asin, {})
         cur = cur_children.get(asin, {})
