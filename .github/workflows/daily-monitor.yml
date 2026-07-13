@@ -11,7 +11,7 @@ on:
         required: false
         default: "false"
       dry_run:
-        description: "Print report to Actions logs without sending Feishu or publishing state"
+        description: "Print the Feishu payload preview without sending Feishu or publishing state"
         required: false
         default: "false"
       daily_report:
@@ -52,6 +52,19 @@ jobs:
       MCP_TIMEOUT_SECONDS: ${{ secrets.MCP_TIMEOUT_SECONDS || '20' }}
       XINGSHANG_TIMEOUT_SECONDS: ${{ secrets.XINGSHANG_TIMEOUT_SECONDS || '90' }}
       XINGSHANG_FORCE_REFRESH: ${{ secrets.XINGSHANG_FORCE_REFRESH || 'false' }}
+      ALERT_PRICE_PCT_THRESHOLD: ${{ secrets.ALERT_PRICE_PCT_THRESHOLD || '5' }}
+      ALERT_CRITICAL_PRICE_PCT_THRESHOLD: ${{ secrets.ALERT_CRITICAL_PRICE_PCT_THRESHOLD || '10' }}
+      ALERT_PRICE_ABS_THRESHOLD: ${{ secrets.ALERT_PRICE_ABS_THRESHOLD || '1' }}
+      ALERT_RANK_PCT_THRESHOLD: ${{ secrets.ALERT_RANK_PCT_THRESHOLD || '20' }}
+      ALERT_LOW_INVENTORY_THRESHOLD: ${{ secrets.ALERT_LOW_INVENTORY_THRESHOLD || '5' }}
+      ALERT_DELIVERY_DAYS_THRESHOLD: ${{ secrets.ALERT_DELIVERY_DAYS_THRESHOLD || '2' }}
+      ALERT_MAX_SUMMARY_ITEMS: ${{ secrets.ALERT_MAX_SUMMARY_ITEMS || '10' }}
+      ALERT_MIN_SEVERITY: ${{ secrets.ALERT_MIN_SEVERITY || 'P1' }}
+      ALERT_DEDUPE_WINDOW_DAYS: ${{ secrets.ALERT_DEDUPE_WINDOW_DAYS || '1' }}
+      ALERT_SEND_NO_CHANGE: ${{ secrets.ALERT_SEND_NO_CHANGE || 'false' }}
+      FEISHU_MESSAGE_MODE: ${{ secrets.FEISHU_MESSAGE_MODE || 'card' }}
+      FULL_REPORT_OUTPUT: state-report.txt
+      FULL_REPORT_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
       CURRENT_REPORT: ${{ github.event.inputs.current_report || 'false' }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       FORCE_CURRENT_REPORT: ${{ github.event.inputs.current_report == 'true' }}
@@ -114,6 +127,13 @@ jobs:
             args+=(--force-daily-report)
           fi
           python monitor.py --state "$STATE_PATH" --output "$STATE_PATH" --delivery-state "$DELIVERY_STATE_PATH" "${args[@]}"
+
+      - name: Upload full daily report
+        if: always() && env.DAILY_REPORT == 'true' && env.RENDER_STATE_ONLY != 'true' && hashFiles('state-report.txt') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: asin-full-daily-report
+          path: state-report.txt
 
       - name: Upload rendered state report
         if: env.RENDER_STATE_ONLY == 'true'

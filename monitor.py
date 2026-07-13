@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
+import alerting
 from cryptography.fernet import Fernet
 
 
@@ -1028,13 +1029,36 @@ def save_delivery_date(path: str, key: str, delivered_on: str) -> None:
     save_current(path, {"delivered_on": delivered_on}, key)
 
 
-def feishu_payload(text: str, *, timestamp: Optional[int] = None, secret: str = "") -> Dict[str, Any]:
-    payload = {"msg_type": "text", "content": {"text": text}}
+def sign_feishu_payload(payload: Dict[str, Any], *, timestamp: Optional[int] = None, secret: str = "") -> Dict[str, Any]:
+    out = dict(payload)
     if secret:
         ts = str(timestamp or int(time.time()))
         sign = hmac.new(f"{ts}\n{secret}".encode("utf-8"), b"", hashlib.sha256).digest()
-        payload.update({"timestamp": ts, "sign": base64.b64encode(sign).decode("ascii")})
-    return payload
+        out.update({"timestamp": ts, "sign": base64.b64encode(sign).decode("ascii")})
+    return out
+
+
+def feishu_payload(text: str, *, timestamp: Optional[int] = None, secret: str = "") -> Dict[str, Any]:
+    return sign_feishu_payload({"msg_type": "text", "content": {"text": text}}, timestamp=timestamp, secret=secret)
+
+
+def feishu_card_payload(card: Mapping[str, Any], *, timestamp: Optional[int] = None, secret: str = "") -> Dict[str, Any]:
+    return sign_feishu_payload({"msg_type": "interactive", "card": dict(card)}, timestamp=timestamp, secret=secret)
+
+
+def build_feishu_alert_card(summary_text: str) -> Dict[str, Any]:
+    first_line = summary_text.splitlines()[0] if summary_text.splitlines() else "ASIN 每日重点提醒"
+    template = "red" if "P0 " in summary_text else "orange"
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": template,
+            "title": {"tag": "plain_text", "content": first_line.split("｜", 1)[0]},
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": summary_text}},
+        ],
+    }
 
 
 def send_feishu(text: str, webhook_url: str, secret: str = "") -> None:
@@ -1052,6 +1076,37 @@ def send_feishu(text: str, webhook_url: str, secret: str = "") -> None:
         if status not in {None, 0, "0"}:
             message = first_text(response.get("StatusMessage")) or first_text(response.get("status_message")) or "unknown error"
             raise MonitorError(f"Feishu response {status}: {message}")
+
+
+def send_feishu_payload(payload: Mapping[str, Any], webhook_url: str) -> None:
+    if not webhook_url:
+        return
+    response = http_json(
+        "POST",
+        webhook_url,
+        payload,
+        {"Content-Type": "application/json"},
+        timeout=20,
+    )
+    if isinstance(response, Mapping):
+        status = response.get("StatusCode", response.get("status_code"))
+        if status not in {None, 0, "0"}:
+            message = first_text(response.get("StatusMessage")) or first_text(response.get("status_message")) or "unknown error"
+            raise MonitorError(f"Feishu response {status}: {message}")
+
+
+def send_daily_alert_payload(primary_payload: Mapping[str, Any], fallback_payload: Optional[Mapping[str, Any]], webhook_url: str) -> None:
+    try:
+        send_feishu_payload(primary_payload, webhook_url)
+    except MonitorError:
+        if (
+            fallback_payload
+            and primary_payload.get("msg_type") == "interactive"
+            and fallback_payload.get("msg_type") == "text"
+        ):
+            send_feishu_payload(fallback_payload, webhook_url)
+            return
+        raise
 
 
 FIELD_LABELS = {
@@ -1487,6 +1542,19 @@ def env_config() -> Dict[str, str]:
         "XINGSHANG_TIMEOUT_SECONDS",
         "XINGSHANG_FORCE_REFRESH",
         "FORCE_CURRENT_REPORT",
+        "ALERT_PRICE_PCT_THRESHOLD",
+        "ALERT_CRITICAL_PRICE_PCT_THRESHOLD",
+        "ALERT_PRICE_ABS_THRESHOLD",
+        "ALERT_RANK_PCT_THRESHOLD",
+        "ALERT_LOW_INVENTORY_THRESHOLD",
+        "ALERT_DELIVERY_DAYS_THRESHOLD",
+        "ALERT_MAX_SUMMARY_ITEMS",
+        "ALERT_MIN_SEVERITY",
+        "ALERT_DEDUPE_WINDOW_DAYS",
+        "ALERT_SEND_NO_CHANGE",
+        "FEISHU_MESSAGE_MODE",
+        "FULL_REPORT_OUTPUT",
+        "FULL_REPORT_URL",
     ):
         config[optional] = os.environ.get(optional, "")
     config["MARKETPLACE"] = config.get("MARKETPLACE") or "US"
@@ -1533,10 +1601,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     current = collect_snapshot(config, previous=previous)
     snapshot_to_persist = merge_snapshot(previous, current)
     changes = diff_snapshots(previous, snapshot_to_persist)
-    messages: List[str]
     if args.daily_report:
-        messages = format_daily_report_messages(previous, snapshot_to_persist, changes)
-    elif args.report_current or config.get("FORCE_CURRENT_REPORT", "").lower() == "true":
+        alert_config = alerting.AlertConfig.from_mapping(config)
+        captured_at = str(snapshot_to_persist.get("captured_at") or now_iso())
+        full_report = "\n\n---\n\n".join(format_daily_report_messages(previous, snapshot_to_persist, changes))
+        if alert_config.full_report_output:
+            os.makedirs(os.path.dirname(alert_config.full_report_output) or ".", exist_ok=True)
+            with open(alert_config.full_report_output, "w", encoding="utf-8") as handle:
+                handle.write(full_report)
+
+        history = previous.get("alert_dedupe") if isinstance(previous, Mapping) else {}
+        if not isinstance(history, Mapping):
+            history = {}
+        events = alerting.build_change_events(previous or {}, snapshot_to_persist, changes, alert_config)
+        visible_events = [event for event in alerting.filter_events(events, alert_config) if event.severity in {"P0", "P1"}]
+        fresh_events, updated_history = alerting.apply_dedupe(visible_events, history, captured_at, alert_config)
+        snapshot_to_persist["alert_dedupe"] = updated_history
+        summary = alerting.render_text_summary(fresh_events, captured_at, alert_config)
+
+        primary_payload: Optional[Dict[str, Any]] = None
+        fallback_payload: Optional[Dict[str, Any]] = None
+        if summary:
+            text_payload = feishu_payload(summary, secret=config.get("FEISHU_WEBHOOK_SECRET", ""))
+            if alert_config.feishu_message_mode == "text":
+                primary_payload = text_payload
+            else:
+                primary_payload = feishu_card_payload(build_feishu_alert_card(summary), secret=config.get("FEISHU_WEBHOOK_SECRET", ""))
+                fallback_payload = text_payload
+
+        if args.dry_run:
+            if primary_payload:
+                print(json.dumps(primary_payload, ensure_ascii=False, sort_keys=True))
+            return 0
+
+        if primary_payload:
+            send_daily_alert_payload(primary_payload, fallback_payload, config["FEISHU_WEBHOOK_URL"])
+        save_current(args.output, snapshot_to_persist, config["STATE_ENCRYPTION_KEY"])
+        save_delivery_date(args.delivery_state, config["STATE_ENCRYPTION_KEY"], today)
+        return 0
+
+    messages: List[str]
+    if args.report_current or config.get("FORCE_CURRENT_REPORT", "").lower() == "true":
         messages = format_snapshot_report_messages(current)
     elif previous is None:
         messages = [format_message(changes, baseline=True)]
@@ -1551,8 +1656,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for message in messages:
                 send_feishu(message, config["FEISHU_WEBHOOK_URL"], config.get("FEISHU_WEBHOOK_SECRET", ""))
                 time.sleep(0.5)
-            if args.daily_report:
-                save_delivery_date(args.delivery_state, config["STATE_ENCRYPTION_KEY"], today)
     if not args.dry_run:
         save_current(args.output, snapshot_to_persist, config["STATE_ENCRYPTION_KEY"])
     return 0
