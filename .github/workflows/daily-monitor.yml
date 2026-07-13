@@ -129,7 +129,7 @@ jobs:
           python monitor.py --state "$STATE_PATH" --output "$STATE_PATH" --delivery-state "$DELIVERY_STATE_PATH" "${args[@]}"
 
       - name: Upload full daily report
-        if: env.DAILY_REPORT == 'true' && env.RENDER_STATE_ONLY != 'true' && hashFiles('state-report.txt') != ''
+        if: always() && env.DAILY_REPORT == 'true' && env.RENDER_STATE_ONLY != 'true' && hashFiles('state-report.txt') != ''
         uses: actions/upload-artifact@v4
         with:
           name: asin-full-daily-report

@@ -258,6 +258,54 @@ def _pct_change(before: Any, after: Any) -> float:
     return abs(after_value - before_value) / abs(before_value) * 100.0
 
 
+def _delivery_days(value: Any, captured_at: Any) -> Optional[int]:
+    text = _text(value)
+    if not text:
+        return None
+    first = re.split(r";\s*fastest\s+", text, maxsplit=1, flags=re.I)[0].strip()
+    numeric = re.search(r"(-?\d+)\s*(?:days?|天)\b", first, re.I)
+    if numeric:
+        return int(numeric.group(1))
+
+    base_date = _event_date(str(captured_at or ""))
+    lower = first.lower()
+    if lower.startswith("today"):
+        return 0
+    if lower.startswith("tomorrow"):
+        return 1
+
+    for fmt in ("%A, %B %d", "%A, %b %d", "%B %d", "%b %d"):
+        try:
+            parsed = datetime.strptime(first, fmt).date().replace(year=base_date.year)
+        except ValueError:
+            continue
+        if parsed < base_date:
+            parsed = parsed.replace(year=parsed.year + 1)
+        return (parsed - base_date).days
+
+    weekday_names = {
+        "mon": 0,
+        "monday": 0,
+        "tue": 1,
+        "tuesday": 1,
+        "wed": 2,
+        "wednesday": 2,
+        "thu": 3,
+        "thursday": 3,
+        "fri": 4,
+        "friday": 4,
+        "sat": 5,
+        "saturday": 5,
+        "sun": 6,
+        "sunday": 6,
+    }
+    token = re.sub(r"[^a-z]", "", lower.split(",", 1)[0])
+    target = weekday_names.get(token)
+    if target is None:
+        return None
+    return (target - base_date.weekday()) % 7
+
+
 def _parent_memberships(snapshot: Mapping[str, Any]) -> Dict[str, str]:
     memberships: Dict[str, str] = {}
     for parent_asin, parent in snapshot.get("parents", {}).items():
@@ -306,6 +354,7 @@ def _classify_child_field(
     after: Any,
     raw: str,
     config: AlertConfig,
+    captured_at: Any,
 ) -> ChangeEvent:
     if field == "inventory":
         inventory = _as_int(after)
@@ -348,7 +397,13 @@ def _classify_child_field(
 
     if field == "delivery_promise":
         detail = f"配送时效：{_display(before)} -> {_display(after)}"
-        return _event("P1", "delivery", parent_asin, child_asin, field, before, after, f"{child_asin} 配送时效变化", detail, "检查库存、配送方式和转化率影响", raw)
+        before_days = _delivery_days(before, captured_at)
+        after_days = _delivery_days(after, captured_at)
+        if before_days is not None and after_days is not None:
+            severity = "P1" if after_days - before_days >= config.delivery_days_threshold else "P2"
+        else:
+            severity = "P2"
+        return _event(severity, "delivery", parent_asin, child_asin, field, before, after, f"{child_asin} 配送时效变化", detail, "检查库存、配送方式和转化率影响", raw)
 
     detail = f"{field}：{_display(before)} -> {_display(after)}"
     return _event("P2", field, parent_asin, child_asin, field, before, after, f"{child_asin} {field}变化", detail, "确认变化是否符合预期", raw)
@@ -378,6 +433,7 @@ def build_change_events(
 ) -> List[ChangeEvent]:
     previous_memberships = _parent_memberships(previous)
     current_memberships = _parent_memberships(current)
+    captured_at = current.get("captured_at") if isinstance(current, Mapping) else None
     events: List[ChangeEvent] = []
 
     parent_field_re = re.compile(rf"^({ASIN_RE}) parent ([a-z_]+): (.*) -> (.*)$")
@@ -397,7 +453,7 @@ def build_change_events(
         if match:
             child_asin, field, before, after = match.groups()
             parent_asin = current_memberships.get(child_asin) or previous_memberships.get(child_asin)
-            events.append(_classify_child_field(child_asin, parent_asin, field, before, after, raw_text, config))
+            events.append(_classify_child_field(child_asin, parent_asin, field, before, after, raw_text, config, captured_at))
             continue
 
         match = child_relation_re.match(raw_text)

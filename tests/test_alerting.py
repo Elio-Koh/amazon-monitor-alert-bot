@@ -519,3 +519,27 @@ class AlertingTest(unittest.TestCase):
         )
 
         self.assertEqual(events[0].title, "CHILD00001 配送时效变化")
+
+    def test_build_change_events_classifies_delivery_slower_by_threshold_as_p1(self):
+        events = alerting.build_change_events(
+            {},
+            {"captured_at": "2026-07-13T01:15:00Z"},
+            ["CHILD00001 child delivery_promise: Tomorrow -> Friday, July 17"],
+            alerting.AlertConfig(delivery_days_threshold=2),
+        )
+
+        self.assertEqual(events[0].severity, "P1")
+        self.assertEqual(events[0].detail, "配送时效：Tomorrow -> Friday, July 17")
+
+    def test_build_change_events_classifies_small_or_faster_delivery_change_as_p2(self):
+        events = alerting.build_change_events(
+            {},
+            {"captured_at": "2026-07-13T01:15:00Z"},
+            [
+                "CHILD00001 child delivery_promise: Tomorrow -> Wednesday, July 15",
+                "CHILD00002 child delivery_promise: Friday, July 17 -> Tomorrow",
+            ],
+            alerting.AlertConfig(delivery_days_threshold=2),
+        )
+
+        self.assertEqual([event.severity for event in events], ["P2", "P2"])
