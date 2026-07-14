@@ -1721,6 +1721,240 @@ def format_daily_report_messages(
     return messages
 
 
+WORKBOOK_HEADERS = [
+    "父 ASIN",
+    "行类型",
+    "子 ASIN",
+    "子体状态",
+    "采集时间",
+    "报告状态",
+    "大类排名",
+    "大类类目",
+    "小类排名",
+    "小类类目",
+    "评分",
+    "评论数",
+    "正常子体数",
+    "库存侧异常数",
+    "价格",
+    "库存",
+    "Coupon",
+    "促销/Deal",
+    "Deal 折扣百分比",
+    "配送时效",
+    "高退货提示",
+    "前台状态",
+    "前台来源",
+    "库存来源",
+    "变化摘要",
+    "数据源摘要",
+]
+
+
+def workbook_value(value: Any, *, empty: str = "无", unknown: str = "未知") -> Any:
+    if value is None:
+        return unknown
+    if value == "":
+        return empty
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    return value
+
+
+def workbook_change_summary(
+    parent_asin: str,
+    child_asin: Optional[str],
+    previous: Optional[Mapping[str, Any]],
+    current: Mapping[str, Any],
+    changes: Sequence[str],
+) -> str:
+    captured_at = current.get("captured_at") or now_iso()
+    lines: List[str] = []
+    for raw in changes:
+        line = str(raw)
+        match = re.fullmatch(r"([A-Z0-9]{10}) parent ([a-z_]+): (.*) -> (.*)", line)
+        if match:
+            asin, field, before, after = match.groups()
+            if child_asin is None and asin == parent_asin:
+                label = FIELD_LABELS.get(field, field)
+                lines.append(
+                    f"{label}：{format_change_field_value(field, before, captured_at)} → {format_change_field_value(field, after, captured_at)}"
+                )
+            continue
+        match = re.fullmatch(r"([A-Z0-9]{10}) child ([a-z_]+): (.*) -> (.*)", line)
+        if match:
+            asin, field, before, after = match.groups()
+            if child_asin == asin:
+                label = FIELD_LABELS.get(field, field)
+                lines.append(
+                    f"{label}：{format_change_field_value(field, before, captured_at)} → {format_change_field_value(field, after, captured_at)}"
+                )
+            continue
+        match = re.fullmatch(r"([A-Z0-9]{10}) child (added|removed): ([A-Z0-9]{10})", line)
+        if match:
+            asin, action, changed_child = match.groups()
+            if asin == parent_asin and child_asin in {None, changed_child}:
+                label = "新增子体" if action == "added" else "解绑子体"
+                lines.append(f"{label}：{changed_child}")
+            continue
+        match = re.fullmatch(r"([A-Z0-9]{10}) inventory-only child (added|removed): ([A-Z0-9]{10})", line)
+        if match:
+            asin, action, changed_child = match.groups()
+            if asin == parent_asin and child_asin in {None, changed_child}:
+                label = "新增库存侧异常" if action == "added" else "移除库存侧异常"
+                lines.append(f"{label}：{changed_child}")
+            continue
+        if child_asin and child_asin in line:
+            lines.append(f"数据源异常：{line}")
+        elif child_asin is None and parent_asin in line:
+            lines.append(f"数据源异常：{line}")
+    return "\n".join(lines) if lines else "无变化"
+
+
+def parent_workbook_rows(
+    snapshot: Mapping[str, Any], previous: Optional[Mapping[str, Any]] = None, changes: Sequence[str] = ()
+) -> List[List[Any]]:
+    captured_at = workbook_value(snapshot.get("captured_at") or now_iso())
+    status = report_status(snapshot)
+    parents = snapshot.get("parents", {}) if isinstance(snapshot.get("parents"), Mapping) else {}
+    children = snapshot.get("children", {}) if isinstance(snapshot.get("children"), Mapping) else {}
+    rows: List[List[Any]] = []
+    for parent_asin in sorted(str(asin) for asin in parents):
+        parent = parents.get(parent_asin)
+        if not isinstance(parent, Mapping):
+            continue
+        child_asins = [str(asin) for asin in parent.get("child_asins") or []]
+        inventory_only_asins = [str(asin) for asin in parent.get("inventory_only_asins") or []]
+        source_summary = format_source_summary(snapshot, parent, children)
+        parent_columns = [
+            workbook_value(parent.get("major_rank")),
+            workbook_value(parent.get("major_category")),
+            workbook_value(parent.get("minor_rank")),
+            workbook_value(parent.get("minor_category")),
+            workbook_value(parent.get("stars")),
+            workbook_value(parent.get("rating_count")),
+            len(child_asins),
+            len(inventory_only_asins),
+        ]
+        parent_front_status = "正常" if has_front_detail(parent) else "前台数据缺失"
+        rows.append(
+            [
+                parent_asin,
+                "父体",
+                "无",
+                "父体",
+                captured_at,
+                status,
+                *parent_columns,
+                "无",
+                "无",
+                "无",
+                "无",
+                "未覆盖",
+                "未覆盖",
+                "未知",
+                parent_front_status,
+                format_source(parent.get("source")),
+                format_source(parent.get("inventory_source")) if parent.get("inventory_source") else "未覆盖",
+                workbook_change_summary(parent_asin, None, previous, snapshot, changes),
+                source_summary,
+            ]
+        )
+        for child_asin in sorted(child_asins):
+            child = children.get(child_asin, {})
+            if not isinstance(child, Mapping):
+                child = {}
+            child_front_status = workbook_value(child.get("front_status"), unknown="正常" if has_front_detail(child) else "前台数据缺失")
+            rows.append(
+                [
+                    parent_asin,
+                    "正常子体",
+                    child_asin,
+                    "正常" if has_front_detail(child) else "前台数据缺失",
+                    captured_at,
+                    status,
+                    *parent_columns,
+                    workbook_value(child.get("price")),
+                    workbook_value(child.get("inventory")),
+                    format_optional_text(child.get("coupon"), child),
+                    format_optional_text(child.get("promotion"), child),
+                    format_coverage(child.get("promotion_discount_pct"), child),
+                    format_delivery_days(child.get("delivery_promise"), captured_at),
+                    workbook_value(child.get("frequently_returned")),
+                    child_front_status,
+                    format_source(child.get("source")),
+                    format_source(child.get("inventory_source")) if child.get("inventory_source") else "未覆盖",
+                    workbook_change_summary(parent_asin, child_asin, previous, snapshot, changes),
+                    source_summary,
+                ]
+            )
+        for child_asin in sorted(inventory_only_asins):
+            child = children.get(child_asin, {})
+            if not isinstance(child, Mapping):
+                child = {}
+            rows.append(
+                [
+                    parent_asin,
+                    "库存侧异常子体",
+                    child_asin,
+                    "库存侧异常",
+                    captured_at,
+                    status,
+                    *parent_columns,
+                    workbook_value(child.get("price")),
+                    workbook_value(child.get("inventory")),
+                    format_optional_text(child.get("coupon"), child),
+                    format_optional_text(child.get("promotion"), child),
+                    format_coverage(child.get("promotion_discount_pct"), child),
+                    format_delivery_days(child.get("delivery_promise"), captured_at),
+                    workbook_value(child.get("frequently_returned")),
+                    workbook_value(child.get("front_status")),
+                    format_source(child.get("source")),
+                    format_source(child.get("inventory_source")) if child.get("inventory_source") else "未覆盖",
+                    workbook_change_summary(parent_asin, child_asin, previous, snapshot, changes),
+                    source_summary,
+                ]
+            )
+    return rows
+
+
+def write_parent_filter_workbook(
+    path: str, previous: Optional[Mapping[str, Any]], current: Mapping[str, Any], changes: Sequence[str]
+) -> None:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    output_path = os.fspath(path)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "父体筛选明细"
+    worksheet.append(WORKBOOK_HEADERS)
+    for row in parent_workbook_rows(current, previous, changes):
+        worksheet.append(row)
+
+    header_fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
+    header_alignment = Alignment(wrap_text=True, vertical="top", horizontal="center")
+    body_alignment = Alignment(wrap_text=True, vertical="top")
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+        cell.alignment = header_alignment
+    for row in worksheet.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = body_alignment
+
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = worksheet.dimensions
+    for index, header in enumerate(WORKBOOK_HEADERS, 1):
+        values = [header]
+        values.extend(cell.value for cell in worksheet[get_column_letter(index)][1:])
+        width = max(len(str(value)) for value in values if value is not None) + 2
+        worksheet.column_dimensions[get_column_letter(index)].width = min(max(width, 10), 38)
+    workbook.save(output_path)
+
+
 def env_config() -> Dict[str, str]:
     required = ["PANGOLINFO_API_TOKEN", "FEISHU_WEBHOOK_URL", "MONITOR_PARENT_ASINS", "STATE_ENCRYPTION_KEY", "XINGSHANG_MCP_URL_TEMPLATE"]
     config = {key: os.environ.get(key, "") for key in required}

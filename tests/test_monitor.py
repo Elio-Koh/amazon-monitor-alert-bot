@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from openpyxl import load_workbook
+
 import monitor
 
 
@@ -505,6 +507,132 @@ class MonitorTest(unittest.TestCase):
 
         self.assertIn("CHILD00001 child promotion_discount_pct: 10% -> 23%", changes)
         self.assertIn("Deal折扣 23%（10%→23%）", detail)
+
+    def test_write_parent_filter_workbook_includes_parent_child_and_inventory_rows(self):
+        headers = [
+            "父 ASIN",
+            "行类型",
+            "子 ASIN",
+            "子体状态",
+            "采集时间",
+            "报告状态",
+            "大类排名",
+            "大类类目",
+            "小类排名",
+            "小类类目",
+            "评分",
+            "评论数",
+            "正常子体数",
+            "库存侧异常数",
+            "价格",
+            "库存",
+            "Coupon",
+            "促销/Deal",
+            "Deal 折扣百分比",
+            "配送时效",
+            "高退货提示",
+            "前台状态",
+            "前台来源",
+            "库存来源",
+            "变化摘要",
+            "数据源摘要",
+        ]
+        previous = self._daily_previous_snapshot(
+            parents={
+                "PARENT1234": {
+                    "major_rank": 100,
+                    "major_category": "Home & Kitchen",
+                    "minor_rank": 20,
+                    "minor_category": "Milk Frothers",
+                    "stars": 4.5,
+                    "rating_count": 100,
+                    "child_asins": ["CHILD00001"],
+                    "inventory_only_asins": [],
+                    "source": "pangolin",
+                    "inventory_source": "xingshang",
+                }
+            },
+            children={
+                "CHILD00001": {
+                    "price": 20.0,
+                    "coupon": "",
+                    "promotion": "",
+                    "promotion_discount_pct": None,
+                    "inventory": 10,
+                    "delivery_promise": "Wednesday, July 15",
+                    "frequently_returned": False,
+                    "source": "pangolin",
+                    "inventory_source": "xingshang",
+                }
+            },
+        )
+        current = self._daily_current_snapshot(
+            parents={
+                "PARENT1234": {
+                    "major_rank": 130,
+                    "major_category": "Home & Kitchen",
+                    "minor_rank": 20,
+                    "minor_category": "Milk Frothers",
+                    "stars": 4.5,
+                    "rating_count": 100,
+                    "child_asins": ["CHILD00001"],
+                    "inventory_only_asins": ["CHILD00002"],
+                    "source": "pangolin",
+                    "inventory_source": "xingshang",
+                }
+            },
+            children={
+                "CHILD00001": {
+                    "price": 23.0,
+                    "coupon": "",
+                    "promotion": "Limited time deal",
+                    "promotion_discount_pct": "23%",
+                    "inventory": 0,
+                    "delivery_promise": "Wednesday, July 15",
+                    "frequently_returned": False,
+                    "source": "pangolin",
+                    "inventory_source": "xingshang",
+                },
+                "CHILD00002": {
+                    "inventory": 4,
+                    "front_status": "不可售/404",
+                    "source": "xingshang_inventory_only",
+                    "inventory_source": "xingshang",
+                },
+            },
+        )
+        changes = monitor.diff_snapshots(previous, current)
+
+        with tempfile.TemporaryDirectory() as directory:
+            workbook_path = os.path.join(directory, "reports", "parent-filter.xlsx")
+            monitor.write_parent_filter_workbook(workbook_path, previous, current, changes)
+
+            workbook = load_workbook(workbook_path)
+            try:
+                self.assertIn("父体筛选明细", workbook.sheetnames)
+                worksheet = workbook["父体筛选明细"]
+                self.assertEqual([cell.value for cell in worksheet[1]], headers)
+                self.assertEqual(worksheet.freeze_panes, "A2")
+                self.assertEqual(worksheet.auto_filter.ref, worksheet.dimensions)
+                rows = [tuple(row) for row in worksheet.iter_rows(min_row=2, values_only=True)]
+                self.assertEqual([row[0] for row in rows], ["PARENT1234", "PARENT1234", "PARENT1234"])
+                self.assertEqual([row[1] for row in rows], ["父体", "正常子体", "库存侧异常子体"])
+
+                normal_child = rows[1]
+                self.assertEqual(normal_child[2], "CHILD00001")
+                self.assertEqual(normal_child[3], "正常")
+                self.assertEqual(normal_child[14], 23.0)
+                self.assertEqual(normal_child[15], 0)
+                self.assertEqual(normal_child[17], "Limited time deal")
+                self.assertEqual(normal_child[18], "23%")
+                self.assertIn("价格", normal_child[24])
+
+                inventory_child = rows[2]
+                self.assertEqual(inventory_child[2], "CHILD00002")
+                self.assertEqual(inventory_child[3], "库存侧异常")
+                self.assertEqual(inventory_child[21], "不可售/404")
+            finally:
+                workbook.close()
 
     def test_daily_parent_detail_embeds_changes_except_inventory_inline_marks(self):
         previous = {
@@ -1033,7 +1161,7 @@ class MonitorTest(unittest.TestCase):
 
         message = monitor.format_snapshot_report(snapshot)
 
-        self.assertIn("B0GJZYZHJJ｜价 42.29｜库存 16｜Coupon 无｜促销 10% off｜时效 6天（7/15）", message)
+        self.assertIn("B0GJZYZHJJ｜价 42.29｜库存 16｜Coupon 无｜促销 10% off｜Deal折扣 未覆盖｜时效 6天（7/15）", message)
         self.assertNotIn("配送 Amazon.com", message)
         self.assertNotIn("退货", message)
 
