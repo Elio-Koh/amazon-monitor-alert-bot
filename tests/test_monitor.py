@@ -299,6 +299,36 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(merged["children"]["CHILD00001"]["promotion"], "Deal")
         self.assertEqual(merged["children"]["CHILD00001"]["inventory"], 9)
 
+    def test_merge_snapshot_does_not_preserve_stale_deal_discount_when_promotion_clears(self):
+        previous = {
+            "parents": {"PARENT1234": {"child_asins": ["CHILD00001"]}},
+            "children": {"CHILD00001": {"promotion": "Lightning Deal", "promotion_discount_pct": "23%"}},
+        }
+        current = {
+            "parents": {"PARENT1234": {"child_asins": ["CHILD00001"]}},
+            "children": {"CHILD00001": {"promotion": "", "promotion_discount_pct": None}},
+        }
+
+        merged = monitor.merge_snapshot(previous, current)
+
+        self.assertEqual(merged["children"]["CHILD00001"]["promotion"], "")
+        self.assertIsNone(merged["children"]["CHILD00001"]["promotion_discount_pct"])
+
+    def test_merge_snapshot_preserves_deal_discount_when_promotion_is_unknown_and_backfilled(self):
+        previous = {
+            "parents": {"PARENT1234": {"child_asins": ["CHILD00001"]}},
+            "children": {"CHILD00001": {"promotion": "Lightning Deal", "promotion_discount_pct": "23%"}},
+        }
+        current = {
+            "parents": {"PARENT1234": {"child_asins": ["CHILD00001"]}},
+            "children": {"CHILD00001": {"promotion": None, "promotion_discount_pct": None}},
+        }
+
+        merged = monitor.merge_snapshot(previous, current)
+
+        self.assertEqual(merged["children"]["CHILD00001"]["promotion"], "Lightning Deal")
+        self.assertEqual(merged["children"]["CHILD00001"]["promotion_discount_pct"], "23%")
+
     def test_feishu_payload_uses_optional_signature(self):
         unsigned = monitor.feishu_payload("hello", timestamp=123, secret="")
         signed = monitor.feishu_payload("hello", timestamp=123, secret="secret")
@@ -435,6 +465,46 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("受影响父体：PARENT1234", messages[0])
         self.assertTrue(any("父 ASIN PARENT1234" in message for message in messages))
         self.assertFalse(any("父 ASIN PARENT5678" in message for message in messages))
+
+    def test_daily_report_shows_deal_discount_percentage_changes(self):
+        previous = {
+            "captured_at": "2026-07-09T01:15:00Z",
+            "parents": {
+                "PARENT1234": {"major_rank": 100, "stars": 4.5, "child_asins": ["CHILD00001"], "source": "pangolin"}
+            },
+            "children": {
+                "CHILD00001": {
+                    "price": 10.0,
+                    "inventory": 5,
+                    "promotion": "Lightning Deal",
+                    "promotion_discount_pct": "10%",
+                    "delivery_promise": "Wednesday, July 15",
+                }
+            },
+            "errors": [],
+        }
+        current = {
+            "captured_at": "2026-07-10T01:15:00Z",
+            "parents": {
+                "PARENT1234": {"major_rank": 100, "stars": 4.5, "child_asins": ["CHILD00001"], "source": "pangolin"}
+            },
+            "children": {
+                "CHILD00001": {
+                    "price": 10.0,
+                    "inventory": 5,
+                    "promotion": "Lightning Deal",
+                    "promotion_discount_pct": "23%",
+                    "delivery_promise": "Wednesday, July 15",
+                }
+            },
+            "errors": [],
+        }
+
+        changes = monitor.diff_snapshots(previous, current)
+        detail = monitor.format_parent_snapshot_report(current, "PARENT1234", current["parents"]["PARENT1234"], current["children"], previous, changes)
+
+        self.assertIn("CHILD00001 child promotion_discount_pct: 10% -> 23%", changes)
+        self.assertIn("Deal折扣 23%（10%→23%）", detail)
 
     def test_daily_parent_detail_embeds_changes_except_inventory_inline_marks(self):
         previous = {
@@ -1080,6 +1150,315 @@ class MonitorTest(unittest.TestCase):
 
         self.assertEqual(child["promotion"], "Limited time deal; 23% off; Buy 2 save 10%")
 
+    def test_normalizes_deal_discount_percentage_from_alias_and_nested_fields(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {
+                "asin": "B0GJZYZHJJ",
+                "price": "$20.24",
+                "dealType": "BD",
+                "deal": {"savingsPercentage": "18%"},
+            },
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Best Deal; 18% off")
+        self.assertEqual(child["promotion_discount_pct"], "18%")
+
+    def test_normalizes_lightning_deal_discount_percentage_without_percent_symbol(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {
+                "asin": "B0GJZYZHJJ",
+                "price": "$20.24",
+                "discountTypes": ["LD"],
+                "discountPercentage": "23",
+            },
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Lightning Deal; 23% off")
+        self.assertEqual(child["promotion_discount_pct"], "23%")
+
+    def test_coupon_only_percentage_is_not_treated_as_deal_discount(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "price": "$20.24", "coupon": "10% coupon"},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "")
+        self.assertIsNone(child["promotion_discount_pct"])
+
+    def test_discount_percentage_without_deal_label_is_not_treated_as_deal_discount(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "price": "$20.24", "discountPercentage": "23"},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "")
+        self.assertIsNone(child["promotion_discount_pct"])
+
+    def test_extracts_deal_discount_percentage_from_deal_bearing_text(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "price": "$20.24", "dealBadge": "Lightning Deal 23% off"},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Lightning Deal 23% off")
+        self.assertEqual(child["promotion_discount_pct"], "23%")
+
+    def test_multibuy_promotion_percentage_is_not_treated_as_deal_discount(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {
+                "asin": "B0GJZYZHJJ",
+                "price": "$20.24",
+                "dealType": "LD",
+                "promotion": "Buy 2 save 10%",
+            },
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Buy 2 save 10%; Lightning Deal")
+        self.assertIsNone(child["promotion_discount_pct"])
+
+    def test_bundle_deal_text_is_not_treated_as_amazon_deal_discount(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "price": "$20.24", "promotion": "Bundle deal 10% off"},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Bundle deal 10% off")
+        self.assertIsNone(child["promotion_discount_pct"])
+
+    def test_coupon_percentage_is_not_used_as_deal_discount_when_deal_label_exists(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {
+                "asin": "B0GJZYZHJJ",
+                "price": "$20.24",
+                "dealType": "LD",
+                "couponInfo": {"percentage": "10%"},
+            },
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Lightning Deal")
+        self.assertIsNone(child["promotion_discount_pct"])
+
+    def test_deal_of_the_day_badge_keeps_label_and_discount_percentage(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "price": "$20.24", "badge": "Deal of the Day", "discountPercentage": "20"},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Deal of the Day; 20% off")
+        self.assertEqual(child["promotion_discount_pct"], "20%")
+
+    def test_deal_subtree_percentage_field_is_treated_as_deal_discount(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {
+                "asin": "B0GJZYZHJJ",
+                "price": "$20.24",
+                "dealType": "BD",
+                "deal": {"percentage": "18%"},
+            },
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Best Deal; 18% off")
+        self.assertEqual(child["promotion_discount_pct"], "18%")
+
+    def test_deal_bearing_promotions_item_discount_percentage_is_extracted(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {
+                "asin": "B0GJZYZHJJ",
+                "price": "$20.24",
+                "promotions": [{"label": "Lightning Deal", "discountPercentage": "23%"}],
+            },
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Lightning Deal; 23% off")
+        self.assertEqual(child["promotion_discount_pct"], "23%")
+
+    def test_nested_deal_type_percentage_is_treated_as_deal_discount(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "price": "$20.24", "deal": {"dealType": "LD", "percentage": "23%"}},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Lightning Deal; 23% off")
+        self.assertEqual(child["promotion_discount_pct"], "23%")
+
+    def test_promotions_item_nested_deal_type_percentage_is_extracted(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "price": "$20.24", "promotions": [{"dealType": "LD", "percentage": "23%"}]},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Lightning Deal; 23% off")
+        self.assertEqual(child["promotion_discount_pct"], "23%")
+
+    def test_dotd_alias_is_normalized_with_discount_percentage(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "price": "$20.24", "dealType": "DOTD", "discountPercentage": "30"},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Deal of the Day; 30% off")
+        self.assertEqual(child["promotion_discount_pct"], "30%")
+
+    def test_best_deal_badge_keeps_label_and_discount_percentage(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "price": "$20.24", "badge": "Best Deal", "discountPercentage": "15"},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Best Deal; 15% off")
+        self.assertEqual(child["promotion_discount_pct"], "15%")
+
+    def test_nested_deal_type_key_alias_is_treated_as_deal_discount(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "price": "$20.24", "deal": {"type": "BD", "percentage": "18%"}},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Best Deal; 18% off")
+        self.assertEqual(child["promotion_discount_pct"], "18%")
+
+    def test_nested_deal_text_key_alias_is_treated_as_deal_discount(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "price": "$20.24", "deal": {"text": "LD", "percent": "23"}},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Lightning Deal; 23% off")
+        self.assertEqual(child["promotion_discount_pct"], "23%")
+
+    def test_promotions_item_name_alias_is_treated_as_deal_discount(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "price": "$20.24", "promotions": [{"name": "DOTD", "percentage": "30%"}]},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Deal of the Day; 30% off")
+        self.assertEqual(child["promotion_discount_pct"], "30%")
+
+    def test_top_level_percentage_is_extracted_when_deal_label_exists(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "dealType": "LD", "percentage": "23%"},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Lightning Deal; 23% off")
+        self.assertEqual(child["promotion_discount_pct"], "23%")
+
+    def test_promotions_text_preserves_existing_deal_discount_display(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "promotions": ["Lightning Deal 23% off"]},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Lightning Deal 23% off")
+        self.assertEqual(child["promotion_discount_pct"], "23%")
+
+    def test_mapping_form_non_deal_promotion_preserves_display_without_deal_discount(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "promotions": [{"label": "Bundle deal 10% off"}]},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Bundle deal 10% off")
+        self.assertIsNone(child["promotion_discount_pct"])
+
+    def test_discount_text_without_percent_marker_is_not_treated_as_deal_discount(self):
+        save_amount = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "dealType": "LD", "discountPercentage": "Save $5"},
+            None,
+            "pangolin",
+        )
+        multibuy = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "dealType": "LD", "percentage": "2 for $10"},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(save_amount["promotion"], "Lightning Deal")
+        self.assertIsNone(save_amount["promotion_discount_pct"])
+        self.assertEqual(multibuy["promotion"], "Lightning Deal")
+        self.assertIsNone(multibuy["promotion_discount_pct"])
+
+    def test_discount_text_uses_number_attached_to_percent_marker(self):
+        symbol = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "dealType": "LD", "discountPercentage": "Save $5 (20%)"},
+            None,
+            "pangolin",
+        )
+        word = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "dealType": "LD", "discountPercentage": "Save $5, 20 percent"},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(symbol["promotion"], "Lightning Deal; 20% off")
+        self.assertEqual(symbol["promotion_discount_pct"], "20%")
+        self.assertEqual(word["promotion"], "Lightning Deal; 20% off")
+        self.assertEqual(word["promotion_discount_pct"], "20%")
+
+    def test_snake_case_deal_fields_are_normalized_with_discount_percentage(self):
+        child = monitor.normalize_child(
+            "B0GJZYZHJJ",
+            {"asin": "B0GJZYZHJJ", "deal_type": "LD", "discount_percentage": "23"},
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["promotion"], "Lightning Deal; 23% off")
+        self.assertEqual(child["promotion_discount_pct"], "23%")
+
     def test_normalizes_pangolin_in_stock_as_inventory_when_xingshang_missing(self):
         child = monitor.normalize_child(
             "B0GJZYZHJJ",
@@ -1654,7 +2033,7 @@ class MonitorTest(unittest.TestCase):
 
         self.assertIn("状态：完整数据（SellerSprite 补源）", message)
         self.assertIn("子体：1", message)
-        self.assertIn("B0FFT34472｜价 85.53｜库存 295｜Coupon 无｜促销 7-Day Deal｜时效 未覆盖", message)
+        self.assertIn("B0FFT34472｜价 85.53｜库存 295｜Coupon 无｜促销 7-Day Deal｜Deal折扣 未覆盖｜时效 未覆盖", message)
         self.assertNotIn("配送 AMZ", message)
         self.assertNotIn("退货", message)
         self.assertIn("库存侧异常：", message)

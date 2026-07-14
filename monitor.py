@@ -30,8 +30,69 @@ CHILD_FIELDS = (
     "price",
     "coupon",
     "promotion",
+    "promotion_discount_pct",
     "inventory",
     "delivery_promise",
+)
+CHILD_MERGE_FIELDS = tuple(field for field in CHILD_FIELDS if field != "promotion_discount_pct")
+DEAL_ALIASES = {
+    "LTD": "Limited time deal",
+    "LD": "Lightning Deal",
+    "BD": "Best Deal",
+    "DOTD": "Deal of the Day",
+}
+DEAL_DISCOUNT_KEYS = {
+    "savingspercentage",
+    "savings_percentage",
+    "discountpercentage",
+    "discount_percentage",
+    "dealdiscountpercentage",
+    "deal_discount_percentage",
+    "dealpercentage",
+    "deal_percentage",
+    "discountpercent",
+    "discount_percent",
+}
+DEAL_SUBTREE_DISCOUNT_KEYS = DEAL_DISCOUNT_KEYS | {
+    "percent",
+    "percentage",
+}
+DEAL_LABEL_KEYS = {
+    "deal",
+    "dealbadge",
+    "deal_badge",
+    "dealtype",
+    "deal_type",
+    "discounttypes",
+    "discount_types",
+    "label",
+    "name",
+    "text",
+    "title",
+    "type",
+    "value",
+}
+DEAL_SUBTREE_FIELDS = ("deal", "dealBadge", "deal_badge", "dealType", "deal_type", "discountTypes", "discount_types", "badge")
+DEAL_TEXT_FIELDS = (
+    "promotion",
+    "deal",
+    "dealBadge",
+    "deal_badge",
+    "dealType",
+    "deal_type",
+    "discountTypes",
+    "discount_types",
+    "badge",
+    "promotions",
+)
+DEAL_TEXT_PATTERNS = (
+    "limited time deal",
+    "lightning deal",
+    "best deal",
+    "deal of the day",
+    "7-day deal",
+    "prime member price",
+    "prime exclusive",
 )
 SITE_BY_MARKETPLACE = {"US": "amz_us", "CA": "amz_ca", "UK": "amz_uk", "DE": "amz_de", "AU": "amz_au", "MX": "amz_mx"}
 ASIN_PATTERN = re.compile(r"^[A-Z0-9]{10}$")
@@ -372,30 +433,156 @@ def front_detail_is_valid(detail: Mapping[str, Any], requested_asin: Optional[st
     )
 
 
-def normalize_promotion(detail: Mapping[str, Any]) -> Optional[str]:
+def normalize_deal_label(value: Any) -> Optional[str]:
+    text = first_text(value)
+    if not text:
+        return None
+    return DEAL_ALIASES.get(text.upper(), text)
+
+
+def extract_deal_label(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        label = normalize_deal_label(value)
+        return label if text_has_deal_label(label) else None
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            normalized_key = str(key).replace("-", "_").lower()
+            if normalized_key in DEAL_LABEL_KEYS:
+                for item in listify(child):
+                    label = extract_deal_label(item)
+                    if label:
+                        return label
+        return None
+    if isinstance(value, list):
+        for item in value:
+            label = extract_deal_label(item)
+            if label:
+                return label
+    return None
+
+
+def iter_nested_key_values(value: Any) -> Iterable[tuple[str, Any]]:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            yield str(key).replace("-", "_").lower(), child
+            yield from iter_nested_key_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from iter_nested_key_values(child)
+
+
+def format_discount_pct(value: Any) -> Optional[str]:
+    text = first_text(value)
+    if not text:
+        return None
+    lower = text.lower()
+    if "%" in text or "percent" in lower:
+        match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:%|percent\b)", text, flags=re.I)
+    else:
+        match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*", text)
+    if not match:
+        return None
+    number = match.group(1)
+    if "." in number:
+        number = number.rstrip("0").rstrip(".")
+    return f"{number}%"
+
+
+def format_explicit_discount_pct(value: Any) -> Optional[str]:
+    text = first_text(value)
+    if not text:
+        return None
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", text)
+    if not match:
+        return None
+    number = match.group(1)
+    if "." in number:
+        number = number.rstrip("0").rstrip(".")
+    return f"{number}%"
+
+
+def text_has_deal_label(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return extract_deal_label(value) is not None
+    text = first_text(value)
+    if not text:
+        return False
+    normalized = normalize_deal_label(text)
+    lower = normalized.lower() if normalized else text.lower()
+    upper = text.upper()
+    if upper in DEAL_ALIASES:
+        return True
+    return any(pattern in lower for pattern in DEAL_TEXT_PATTERNS)
+
+
+def detail_has_deal_label(detail: Mapping[str, Any]) -> bool:
+    for key in DEAL_TEXT_FIELDS:
+        for item in listify(detail.get(key)):
+            if text_has_deal_label(item):
+                return True
+    return False
+
+
+def extract_deal_discount_pct(detail: Mapping[str, Any]) -> Optional[str]:
+    has_deal_label = detail_has_deal_label(detail)
+    if not has_deal_label:
+        return None
+    for key, value in detail.items():
+        normalized_key = str(key).replace("-", "_").lower()
+        if normalized_key in DEAL_SUBTREE_DISCOUNT_KEYS:
+            pct = format_discount_pct(value)
+            if pct:
+                return pct
+    for field in DEAL_SUBTREE_FIELDS:
+        for key, value in iter_nested_key_values(detail.get(field)):
+            if key in DEAL_SUBTREE_DISCOUNT_KEYS:
+                pct = format_discount_pct(value)
+                if pct:
+                    return pct
+    for item in listify(detail.get("promotions")):
+        if not isinstance(item, Mapping) or not text_has_deal_label(item):
+            continue
+        for key, value in iter_nested_key_values(item):
+            if key in DEAL_SUBTREE_DISCOUNT_KEYS:
+                pct = format_discount_pct(value)
+                if pct:
+                    return pct
+    for key in DEAL_TEXT_FIELDS:
+        for item in listify(detail.get(key)):
+            if not text_has_deal_label(item):
+                continue
+            pct = format_explicit_discount_pct(item)
+            if pct:
+                return pct
+    return None
+
+
+def normalize_promotion(detail: Mapping[str, Any], promotion_discount_pct: Optional[str] = None) -> Optional[str]:
     parts: List[str] = []
 
     def add(value: Any) -> None:
-        text = first_text(value)
+        text = extract_deal_label(value) if isinstance(value, Mapping) else None
+        if not text:
+            text = normalize_deal_label(value) or first_text(value)
         if not text:
             return
-        if text.upper() == "LTD":
-            text = "Limited time deal"
         lower = text.lower()
         if "amazon's choice" in lower or "amazon choice" in lower or "best seller" in lower:
             return
         if text not in parts:
             parts.append(text)
 
-    for key in ("promotion", "deal", "dealBadge", "dealType", "discountTypes"):
+    for key in ("promotion", "deal", "dealBadge", "deal_badge", "dealType", "deal_type", "discountTypes", "discount_types"):
         for item in listify(detail.get(key)):
             add(item)
     badge = first_text(detail.get("badge"))
-    if badge and (badge.upper() == "LTD" or any(label in badge.lower() for label in ("limited time deal", "lightning deal", "prime member price"))):
+    if badge and text_has_deal_label(badge):
         add(badge)
-    savings = first_text(detail.get("savingsPercentage"))
-    if savings:
-        add(f"{savings} off")
+    for item in listify(detail.get("promotions")):
+        if text_has_deal_label(item):
+            add(item)
+    if promotion_discount_pct and not any(promotion_discount_pct in part for part in parts):
+        add(f"{promotion_discount_pct} off")
     for item in listify(detail.get("promotions")):
         if isinstance(item, Mapping):
             quantity = first_text(item.get("quantity"))
@@ -455,7 +642,8 @@ def normalize_child(child_asin: str, detail: Mapping[str, Any], inventory: Optio
     badge = detail.get("badge") if isinstance(detail.get("badge"), Mapping) else {}
     has_detail = any(key != "asin" for key in detail)
     coupon = first_text(detail.get("coupon") or detail.get("couponInfo") or detail.get("couponText"))
-    promotion = normalize_promotion(detail)
+    promotion_discount_pct = extract_deal_discount_pct(detail)
+    promotion = normalize_promotion(detail, promotion_discount_pct)
     return_badge = first_present(
         detail.get("frequentlyReturned"),
         detail.get("frequently_returned"),
@@ -482,6 +670,7 @@ def normalize_child(child_asin: str, detail: Mapping[str, Any], inventory: Optio
         "price": parse_float(detail.get("price") or detail.get("finalPrice") or detail.get("price_display")),
         "coupon": coupon if coupon is not None else ("" if has_detail else None),
         "promotion": promotion if promotion is not None else ("" if has_detail else None),
+        "promotion_discount_pct": promotion_discount_pct,
         "frequently_returned": frequently_returned,
         "inventory": inventory if inventory is not None else front_inventory,
         "inventory_source": "xingshang" if inventory is not None else ("front_detail" if front_inventory is not None else None),
@@ -929,9 +1118,17 @@ def merge_snapshot(previous: Optional[Mapping[str, Any]], current: Mapping[str, 
         latest = current_children[asin]
         if not isinstance(prior, Mapping) or not isinstance(latest, dict):
             continue
-        for field in CHILD_FIELDS:
+        promotion_was_unknown = snapshot_value_is_unknown(latest.get("promotion"))
+        for field in CHILD_MERGE_FIELDS:
             if snapshot_value_is_unknown(latest.get(field)) and not snapshot_value_is_unknown(prior.get(field)):
                 latest[field] = copy.deepcopy(prior.get(field))
+        if (
+            promotion_was_unknown
+            and latest.get("promotion") == prior.get("promotion")
+            and snapshot_value_is_unknown(latest.get("promotion_discount_pct"))
+            and not snapshot_value_is_unknown(prior.get("promotion_discount_pct"))
+        ):
+            latest["promotion_discount_pct"] = copy.deepcopy(prior.get("promotion_discount_pct"))
     return merged
 
 
@@ -1116,6 +1313,7 @@ FIELD_LABELS = {
     "price": "价格",
     "coupon": "Coupon",
     "promotion": "促销/Deal",
+    "promotion_discount_pct": "Deal折扣",
     "frequently_returned": "高退货率标签",
     "inventory": "库存",
     "fulfillment_method": "配送方式",
@@ -1401,6 +1599,7 @@ def format_parent_snapshot_report(
             f"库存 {format_value(child.get('inventory'))}｜"
             f"Coupon {format_optional_text(child.get('coupon'), child)}{markers.get('coupon', '')}｜"
             f"促销 {format_optional_text(child.get('promotion'), child)}{markers.get('promotion', '')}｜"
+            f"Deal折扣 {format_coverage(child.get('promotion_discount_pct'), child)}{markers.get('promotion_discount_pct', '')}｜"
             f"时效 {format_delivery_days(child.get('delivery_promise'), captured_at)}{markers.get('delivery_promise', '')}"
         )
     if inventory_only_asins:
