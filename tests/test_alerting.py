@@ -19,6 +19,7 @@ class AlertingTest(unittest.TestCase):
                 "ALERT_SEND_NO_CHANGE": "true",
                 "FEISHU_MESSAGE_MODE": "text",
                 "FULL_REPORT_OUTPUT": "state-report.txt",
+                "FULL_REPORT_XLSX_OUTPUT": "state-report.xlsx",
                 "FULL_REPORT_URL": "https://github.example/actions/runs/1",
             }
         )
@@ -35,6 +36,7 @@ class AlertingTest(unittest.TestCase):
         self.assertTrue(config.send_no_change)
         self.assertEqual(config.feishu_message_mode, "text")
         self.assertEqual(config.full_report_output, "state-report.txt")
+        self.assertEqual(config.full_report_xlsx_output, "state-report.xlsx")
         self.assertEqual(config.full_report_url, "https://github.example/actions/runs/1")
 
     def test_alert_config_clamps_negative_minimum_values(self):

@@ -52,6 +52,7 @@ class AlertConfig:
     send_no_change: bool = False
     feishu_message_mode: str = "card"
     full_report_output: str = ""
+    full_report_xlsx_output: str = ""
     full_report_url: str = ""
 
     @classmethod
@@ -75,6 +76,7 @@ class AlertConfig:
             send_no_change=_bool_config(config, "ALERT_SEND_NO_CHANGE", False),
             feishu_message_mode=mode,
             full_report_output=str(config.get("FULL_REPORT_OUTPUT", "")).strip(),
+            full_report_xlsx_output=str(config.get("FULL_REPORT_XLSX_OUTPUT", "")).strip(),
             full_report_url=str(config.get("FULL_REPORT_URL", "")).strip(),
         )
 

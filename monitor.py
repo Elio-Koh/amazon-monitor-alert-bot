@@ -1986,6 +1986,7 @@ def env_config() -> Dict[str, str]:
         "ALERT_SEND_NO_CHANGE",
         "FEISHU_MESSAGE_MODE",
         "FULL_REPORT_OUTPUT",
+        "FULL_REPORT_XLSX_OUTPUT",
         "FULL_REPORT_URL",
     ):
         config[optional] = os.environ.get(optional, "")
@@ -2022,7 +2023,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             changes = diff_snapshots(previous, snapshot)
             print("\n\n---\n\n".join(format_daily_report_messages(previous, snapshot, changes)))
         else:
+            changes = []
             print(format_snapshot_report(snapshot))
+        workbook_output = os.environ.get("FULL_REPORT_XLSX_OUTPUT", "").strip()
+        if workbook_output:
+            write_parent_filter_workbook(workbook_output, previous, snapshot, changes)
         return 0
 
     config = env_config()
@@ -2041,6 +2046,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             os.makedirs(os.path.dirname(alert_config.full_report_output) or ".", exist_ok=True)
             with open(alert_config.full_report_output, "w", encoding="utf-8") as handle:
                 handle.write(full_report)
+        if alert_config.full_report_xlsx_output:
+            write_parent_filter_workbook(alert_config.full_report_xlsx_output, previous, snapshot_to_persist, changes)
 
         history = previous.get("alert_dedupe") if isinstance(previous, Mapping) else {}
         if not isinstance(history, Mapping):

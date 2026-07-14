@@ -754,6 +754,37 @@ class MonitorTest(unittest.TestCase):
             self.assertIn("- 大类排名：100 → 90", output)
             self.assertIn("价 11.0（10.0→11.0）", output)
 
+    def test_render_state_only_writes_filterable_workbook_when_configured(self):
+        key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+        previous = self._daily_previous_snapshot()
+        current = self._daily_current_snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "latest.enc.json")
+            previous_path = os.path.join(directory, "previous.enc.json")
+            workbook_path = os.path.join(directory, "reports", "state-report.xlsx")
+            monitor.save_current(state_path, current, key)
+            monitor.save_current(previous_path, previous, key)
+            stdout = io.StringIO()
+
+            with (
+                patch.dict(os.environ, {"STATE_ENCRYPTION_KEY": key, "FULL_REPORT_XLSX_OUTPUT": workbook_path}, clear=True),
+                patch("monitor.collect_snapshot") as collect,
+                patch("sys.stdout", stdout),
+            ):
+                result = monitor.main(["--state", state_path, "--previous-state", previous_path, "--render-state-only"])
+
+            self.assertEqual(result, 0)
+            collect.assert_not_called()
+            self.assertIn("ASIN 每日监控", stdout.getvalue())
+            workbook = load_workbook(workbook_path)
+            try:
+                worksheet = workbook["父体筛选明细"]
+                self.assertEqual(worksheet["A1"].value, "父 ASIN")
+                self.assertEqual(worksheet["A2"].value, "PARENT1234")
+                self.assertEqual(worksheet["A3"].value, "PARENT1234")
+            finally:
+                workbook.close()
+
     def test_partial_daily_report_merges_and_persists_snapshot(self):
         key = base64.urlsafe_b64encode(os.urandom(32)).decode()
         previous = {
@@ -861,6 +892,36 @@ class MonitorTest(unittest.TestCase):
             self.assertIn("父 ASIN PARENT1234", full_report)
             summary = send_daily.call_args.args[1]["content"]["text"]
             self.assertNotIn("监控范围", summary)
+
+    def test_full_report_xlsx_output_writes_filterable_workbook_without_sending_it(self):
+        key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+        previous = self._daily_previous_snapshot()
+        current = self._daily_current_snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "latest.enc.json")
+            delivery_path = os.path.join(directory, "delivery.enc.json")
+            workbook_path = os.path.join(directory, "reports", "daily.xlsx")
+            monitor.save_current(state_path, previous, key)
+
+            with (
+                patch("monitor.env_config", return_value=self._daily_config(key, FULL_REPORT_XLSX_OUTPUT=workbook_path)),
+                patch("monitor.now_iso", return_value="2026-07-10T01:15:00Z"),
+                patch("monitor.collect_snapshot", return_value=current),
+                patch("monitor.send_daily_alert_payload"),
+            ):
+                result = monitor.main(["--daily-report", "--state", state_path, "--output", state_path, "--delivery-state", delivery_path])
+
+            self.assertEqual(result, 0)
+            workbook = load_workbook(workbook_path)
+            try:
+                worksheet = workbook["父体筛选明细"]
+                self.assertEqual(worksheet["A1"].value, "父 ASIN")
+                self.assertEqual(worksheet["A2"].value, "PARENT1234")
+                self.assertEqual(worksheet["A3"].value, "PARENT1234")
+                self.assertEqual(worksheet["B2"].value, "父体")
+                self.assertEqual(worksheet["B3"].value, "正常子体")
+            finally:
+                workbook.close()
 
     def test_daily_report_with_only_p2_events_saves_state_and_delivery_without_feishu(self):
         key = base64.urlsafe_b64encode(os.urandom(32)).decode()
