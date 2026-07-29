@@ -89,8 +89,8 @@ class AlertingTest(unittest.TestCase):
             field="promotion",
             before="Limited time deal",
             after="",
-            title="CHILD00001 促销结束",
-            detail="促销/Deal：Limited time deal -> 无",
+            title="CHILD00001 Deal结束",
+            detail="Deal：Limited time deal -> 无",
             action="检查广告预算和价格竞争力",
             raw="CHILD00001 child promotion: Limited time deal -> ",
         )
@@ -127,7 +127,7 @@ class AlertingTest(unittest.TestCase):
 
     def test_render_text_summary_includes_only_p0_p1_and_full_report_link(self):
         events = [
-            alerting.ChangeEvent("P0", "promotion", "PARENT1234", "CHILD00001", "promotion", "Deal", "", "CHILD00001 促销/Deal结束", "促销/Deal：Deal -> 无", "检查广告预算、价格竞争力和促销排期", "raw1"),
+            alerting.ChangeEvent("P0", "promotion", "PARENT1234", "CHILD00001", "promotion", "Deal", "", "CHILD00001 Deal结束", "Deal：Deal -> 无", "检查广告预算、价格竞争力和促销排期", "raw1"),
             alerting.ChangeEvent("P1", "price", "PARENT1234", "CHILD00002", "price", "20.0", "21.2", "CHILD00002 价格变化", "价格：20.0 -> 21.2", "检查竞品价格、广告 ACOS 和预算", "raw2"),
             alerting.ChangeEvent("P2", "rating_count", "PARENT1234", None, "rating_count", "10", "11", "P2 hidden", "评论数：10 -> 11", "归档", "raw3"),
         ]
@@ -138,7 +138,7 @@ class AlertingTest(unittest.TestCase):
         self.assertIn("ASIN 每日重点提醒｜北京时间 2026-07-13 09:15:00", summary)
         self.assertIn("今日结论：P0 1 项｜P1 1 项", summary)
         self.assertIn("P0 必看", summary)
-        self.assertIn("CHILD00001 促销/Deal结束", summary)
+        self.assertIn("CHILD00001 Deal结束", summary)
         self.assertIn("P1 复核", summary)
         self.assertIn("CHILD00002 价格变化", summary)
         self.assertIn("完整报告：https://github.example/actions/runs/1", summary)
@@ -161,7 +161,7 @@ class AlertingTest(unittest.TestCase):
 
     def test_render_text_summary_shows_p1_hidden_count_when_p0_consumes_item_budget(self):
         events = [
-            alerting.ChangeEvent("P0", "promotion", "PARENT1234", "CHILD00001", "promotion", "Deal", "", "CHILD00001 促销/Deal结束", "促销/Deal：Deal -> 无", "检查广告预算、价格竞争力和促销排期", "raw1"),
+            alerting.ChangeEvent("P0", "promotion", "PARENT1234", "CHILD00001", "promotion", "Deal", "", "CHILD00001 Deal结束", "Deal：Deal -> 无", "检查广告预算、价格竞争力和促销排期", "raw1"),
             alerting.ChangeEvent("P1", "price", "PARENT1234", "CHILD00002", "price", "20.0", "21.2", "CHILD00002 价格变化", "价格：20.0 -> 21.2", "检查竞品价格、广告 ACOS 和预算", "raw2"),
         ]
 
@@ -171,14 +171,14 @@ class AlertingTest(unittest.TestCase):
             alerting.AlertConfig(max_summary_items=1),
         )
 
-        self.assertIn("CHILD00001 促销/Deal结束", summary)
+        self.assertIn("CHILD00001 Deal结束", summary)
         self.assertIn("P1 复核：", summary)
         self.assertIn("... 还有 1 项同级重点事项，见完整报告", summary)
         self.assertNotIn("CHILD00002 价格变化", summary)
 
     def test_render_text_summary_shows_p0_hidden_count_when_p0_exceeds_item_budget(self):
         events = [
-            alerting.ChangeEvent("P0", "promotion", "PARENT1234", "CHILD00001", "promotion", "Deal", "", "CHILD00001 促销/Deal结束", "促销/Deal：Deal -> 无", "检查广告预算、价格竞争力和促销排期", "raw1"),
+            alerting.ChangeEvent("P0", "promotion", "PARENT1234", "CHILD00001", "promotion", "Deal", "", "CHILD00001 Deal结束", "Deal：Deal -> 无", "检查广告预算、价格竞争力和促销排期", "raw1"),
             alerting.ChangeEvent("P0", "inventory", "PARENT1234", "CHILD00002", "inventory", "1", "0", "CHILD00002 库存归零", "库存：1 -> 0", "检查补货、广告预算和前台可售状态", "raw2"),
         ]
 
@@ -188,7 +188,7 @@ class AlertingTest(unittest.TestCase):
             alerting.AlertConfig(max_summary_items=1),
         )
 
-        self.assertIn("CHILD00001 促销/Deal结束", summary)
+        self.assertIn("CHILD00001 Deal结束", summary)
         self.assertNotIn("CHILD00002 库存归零", summary)
         self.assertIn("... 还有 1 项同级重点事项，见完整报告", summary)
 
@@ -384,7 +384,7 @@ class AlertingTest(unittest.TestCase):
         self.assertEqual(events[0].parent_asin, "PARENT1234")
         self.assertEqual(events[0].child_asin, "CHILD00001")
         self.assertEqual(events[0].category, "promotion")
-        self.assertEqual(events[0].title, "CHILD00001 促销/Deal结束")
+        self.assertEqual(events[0].title, "CHILD00001 Deal结束")
         self.assertEqual(events[0].action, "检查广告预算、价格竞争力和促销排期")
 
     def test_build_change_events_classifies_small_price_change_as_p2(self):
@@ -473,9 +473,9 @@ class AlertingTest(unittest.TestCase):
         events = alerting.build_change_events(previous, current, changes, alerting.AlertConfig())
 
         self.assertEqual([event.severity for event in events], ["P0", "P1"])
-        self.assertEqual(events[0].title, "CHILD00001 促销/Deal开始")
-        self.assertEqual(events[0].detail, "促销/Deal：无 -> 7-Day Deal")
-        self.assertEqual(events[1].title, "CHILD00002 促销/Deal变化")
+        self.assertEqual(events[0].title, "CHILD00001 Deal开始")
+        self.assertEqual(events[0].detail, "Deal：无 -> 7-Day Deal")
+        self.assertEqual(events[1].title, "CHILD00002 Deal变化")
 
     def test_build_change_events_classifies_parent_failed_case_insensitively(self):
         events = alerting.build_change_events({}, {}, ["PARENT1234 PARENT FAILED: timeout"], alerting.AlertConfig())

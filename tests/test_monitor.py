@@ -171,7 +171,7 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("评论数：100 → 101", message)
         self.assertIn("1. CHILD00001", message)
         self.assertIn("价格：10.0 → 11.0", message)
-        self.assertNotIn("促销/Deal：未知 → 7-Day Deal", message)
+        self.assertNotIn("Deal：未知 → 7-Day Deal", message)
         self.assertIn("数据源异常：", message)
 
     def test_diff_ignores_unknown_to_known_field_values(self):
@@ -527,7 +527,7 @@ class MonitorTest(unittest.TestCase):
             "价格",
             "库存",
             "Coupon",
-            "促销/Deal",
+            "Deal",
             "Deal 折扣百分比",
             "配送时效",
             "高退货提示",
@@ -595,8 +595,8 @@ class MonitorTest(unittest.TestCase):
                 },
                 "CHILD00002": {
                     "inventory": 4,
-                    "front_status": "不可售/404",
-                    "source": "xingshang_inventory_only",
+                    "front_status": "pangolin 前台侧未确认",
+                    "source": "xingshang_candidate_unconfirmed",
                     "inventory_source": "xingshang",
                 },
             },
@@ -616,7 +616,7 @@ class MonitorTest(unittest.TestCase):
                 self.assertEqual(worksheet.auto_filter.ref, worksheet.dimensions)
                 rows = [tuple(row) for row in worksheet.iter_rows(min_row=2, values_only=True)]
                 self.assertEqual([row[0] for row in rows], ["PARENT1234", "PARENT1234", "PARENT1234"])
-                self.assertEqual([row[1] for row in rows], ["父体", "正常子体", "库存侧异常子体"])
+                self.assertEqual([row[1] for row in rows], ["父体", "正常子体", "xingshang mcp 候选，但 pangolin 前台侧未确认"])
 
                 normal_child = rows[1]
                 self.assertEqual(normal_child[2], "CHILD00001")
@@ -629,8 +629,8 @@ class MonitorTest(unittest.TestCase):
 
                 inventory_child = rows[2]
                 self.assertEqual(inventory_child[2], "CHILD00002")
-                self.assertEqual(inventory_child[3], "库存侧异常")
-                self.assertEqual(inventory_child[21], "不可售/404")
+                self.assertEqual(inventory_child[3], "pangolin 前台侧未确认")
+                self.assertEqual(inventory_child[21], "pangolin 前台侧未确认")
             finally:
                 workbook.close()
 
@@ -654,7 +654,8 @@ class MonitorTest(unittest.TestCase):
                 "CHILD00001": {
                     "price": 11.0,
                     "inventory": 7,
-                    "promotion": "Limited time deal; 10% off",
+                    "promotion": "Limited time deal",
+                    "promotion_discount_pct": "10%",
                     "delivery_promise": "Thursday, July 16",
                 }
             },
@@ -671,7 +672,8 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("- CHILD00001 价格：10.0 → 11.0", detail)
         self.assertIn("- 库存变化：1 个子体", detail)
         self.assertIn("价 11.0（10.0→11.0）", detail)
-        self.assertIn("促销 Limited time deal; 10% off（无→Limited time deal; 10% off）", detail)
+        self.assertIn("Deal Limited time deal（无→Limited time deal）", detail)
+        self.assertIn("Deal折扣 10%", detail)
         self.assertIn("时效 7天（7/16）（6天（7/15）→7天（7/16））", detail)
         self.assertIn("库存 7｜", detail)
         self.assertNotIn("库存 7（5→7）", detail)
@@ -1141,7 +1143,7 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("CHILD00001", message)
         self.assertIn("价 23.99", message)
         self.assertIn("库存 7", message)
-        self.assertIn("促销 7-Day Deal", message)
+        self.assertIn("Deal 7-Day Deal", message)
 
     def test_formats_current_snapshot_report_as_grouped_messages(self):
         snapshot = {
@@ -1208,8 +1210,8 @@ class MonitorTest(unittest.TestCase):
             "children": {
                 "B0GJZYZHJJ": {
                     "price": 42.29,
-                    "coupon": "",
-                    "promotion": "10% off",
+                    "coupon": "10% off",
+                    "promotion": "",
                     "inventory": 16,
                     "fulfillment_method": "Amazon.com",
                     "frequently_returned": False,
@@ -1222,7 +1224,7 @@ class MonitorTest(unittest.TestCase):
 
         message = monitor.format_snapshot_report(snapshot)
 
-        self.assertIn("B0GJZYZHJJ｜价 42.29｜库存 16｜Coupon 无｜促销 10% off｜Deal折扣 未覆盖｜时效 6天（7/15）", message)
+        self.assertIn("B0GJZYZHJJ｜价 42.29｜库存 16｜Coupon 10% off｜Deal 无｜Deal折扣 未覆盖｜时效 6天（7/15）", message)
         self.assertNotIn("配送 Amazon.com", message)
         self.assertNotIn("退货", message)
 
@@ -1321,7 +1323,8 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Limited time deal; 23% off")
+        self.assertEqual(child["promotion"], "Limited time deal")
+        self.assertEqual(child["promotion_discount_pct"], "23%")
 
     def test_normalizes_pangolin_discount_types_savings_and_promotions(self):
         child = monitor.normalize_child(
@@ -1337,7 +1340,63 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Limited time deal; 23% off; Buy 2 save 10%")
+        self.assertEqual(child["coupon"], "Buy 2 save 10%")
+        self.assertEqual(child["promotion"], "Limited time deal")
+        self.assertEqual(child["promotion_discount_pct"], "23%")
+
+    def test_list_price_discount_is_current_price_not_coupon_or_deal(self):
+        child = monitor.normalize_child(
+            "B082314NFL",
+            {
+                "asin": "B082314NFL",
+                "price": "$8.99",
+                "listPrice": "$16.99",
+                "discountPercentage": "47%",
+                "promotion": "-47%",
+            },
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["price"], 8.99)
+        self.assertEqual(child["coupon"], "")
+        self.assertEqual(child["promotion"], "")
+        self.assertIsNone(child["promotion_discount_pct"])
+
+    def test_brand_promotion_savings_are_coupon_not_deal(self):
+        child = monitor.normalize_child(
+            "B0G3PDFXJS",
+            {
+                "asin": "B0G3PDFXJS",
+                "price": "$19.99",
+                "promotions": [{"label": "Save 10%", "text": "with brand promotion LB2SWR42ZRWO"}],
+            },
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["coupon"], "Save 10% with brand promotion LB2SWR42ZRWO")
+        self.assertEqual(child["promotion"], "")
+        self.assertIsNone(child["promotion_discount_pct"])
+
+    def test_prime_member_price_is_price_not_deal(self):
+        child = monitor.normalize_child(
+            "B0GWRQ3CWB",
+            {
+                "asin": "B0GWRQ3CWB",
+                "price": "$37.99",
+                "dealType": "Prime Member Price",
+                "promotion": "Prime Member Price",
+                "regularPrice": "$109.99",
+            },
+            None,
+            "pangolin",
+        )
+
+        self.assertEqual(child["price"], 37.99)
+        self.assertEqual(child["coupon"], "")
+        self.assertEqual(child["promotion"], "")
+        self.assertIsNone(child["promotion_discount_pct"])
 
     def test_normalizes_deal_discount_percentage_from_alias_and_nested_fields(self):
         child = monitor.normalize_child(
@@ -1352,7 +1411,7 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Best Deal; 18% off")
+        self.assertEqual(child["promotion"], "Best Deal")
         self.assertEqual(child["promotion_discount_pct"], "18%")
 
     def test_normalizes_lightning_deal_discount_percentage_without_percent_symbol(self):
@@ -1368,7 +1427,7 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Lightning Deal; 23% off")
+        self.assertEqual(child["promotion"], "Lightning Deal")
         self.assertEqual(child["promotion_discount_pct"], "23%")
 
     def test_coupon_only_percentage_is_not_treated_as_deal_discount(self):
@@ -1401,7 +1460,7 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Lightning Deal 23% off")
+        self.assertEqual(child["promotion"], "Lightning Deal")
         self.assertEqual(child["promotion_discount_pct"], "23%")
 
     def test_multibuy_promotion_percentage_is_not_treated_as_deal_discount(self):
@@ -1417,7 +1476,8 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Buy 2 save 10%; Lightning Deal")
+        self.assertEqual(child["coupon"], "Buy 2 save 10%")
+        self.assertEqual(child["promotion"], "Lightning Deal")
         self.assertIsNone(child["promotion_discount_pct"])
 
     def test_bundle_deal_text_is_not_treated_as_amazon_deal_discount(self):
@@ -1428,7 +1488,8 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Bundle deal 10% off")
+        self.assertEqual(child["coupon"], "Bundle deal 10% off")
+        self.assertEqual(child["promotion"], "")
         self.assertIsNone(child["promotion_discount_pct"])
 
     def test_coupon_percentage_is_not_used_as_deal_discount_when_deal_label_exists(self):
@@ -1455,7 +1516,7 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Deal of the Day; 20% off")
+        self.assertEqual(child["promotion"], "Deal of the Day")
         self.assertEqual(child["promotion_discount_pct"], "20%")
 
     def test_deal_subtree_percentage_field_is_treated_as_deal_discount(self):
@@ -1471,7 +1532,7 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Best Deal; 18% off")
+        self.assertEqual(child["promotion"], "Best Deal")
         self.assertEqual(child["promotion_discount_pct"], "18%")
 
     def test_deal_bearing_promotions_item_discount_percentage_is_extracted(self):
@@ -1486,7 +1547,7 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Lightning Deal; 23% off")
+        self.assertEqual(child["promotion"], "Lightning Deal")
         self.assertEqual(child["promotion_discount_pct"], "23%")
 
     def test_nested_deal_type_percentage_is_treated_as_deal_discount(self):
@@ -1497,7 +1558,7 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Lightning Deal; 23% off")
+        self.assertEqual(child["promotion"], "Lightning Deal")
         self.assertEqual(child["promotion_discount_pct"], "23%")
 
     def test_promotions_item_nested_deal_type_percentage_is_extracted(self):
@@ -1508,7 +1569,7 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Lightning Deal; 23% off")
+        self.assertEqual(child["promotion"], "Lightning Deal")
         self.assertEqual(child["promotion_discount_pct"], "23%")
 
     def test_dotd_alias_is_normalized_with_discount_percentage(self):
@@ -1519,7 +1580,7 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Deal of the Day; 30% off")
+        self.assertEqual(child["promotion"], "Deal of the Day")
         self.assertEqual(child["promotion_discount_pct"], "30%")
 
     def test_best_deal_badge_keeps_label_and_discount_percentage(self):
@@ -1530,7 +1591,7 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Best Deal; 15% off")
+        self.assertEqual(child["promotion"], "Best Deal")
         self.assertEqual(child["promotion_discount_pct"], "15%")
 
     def test_nested_deal_type_key_alias_is_treated_as_deal_discount(self):
@@ -1541,7 +1602,7 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Best Deal; 18% off")
+        self.assertEqual(child["promotion"], "Best Deal")
         self.assertEqual(child["promotion_discount_pct"], "18%")
 
     def test_nested_deal_text_key_alias_is_treated_as_deal_discount(self):
@@ -1552,7 +1613,7 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Lightning Deal; 23% off")
+        self.assertEqual(child["promotion"], "Lightning Deal")
         self.assertEqual(child["promotion_discount_pct"], "23%")
 
     def test_promotions_item_name_alias_is_treated_as_deal_discount(self):
@@ -1563,7 +1624,7 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Deal of the Day; 30% off")
+        self.assertEqual(child["promotion"], "Deal of the Day")
         self.assertEqual(child["promotion_discount_pct"], "30%")
 
     def test_top_level_percentage_is_extracted_when_deal_label_exists(self):
@@ -1574,7 +1635,7 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Lightning Deal; 23% off")
+        self.assertEqual(child["promotion"], "Lightning Deal")
         self.assertEqual(child["promotion_discount_pct"], "23%")
 
     def test_promotions_text_preserves_existing_deal_discount_display(self):
@@ -1585,10 +1646,10 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Lightning Deal 23% off")
+        self.assertEqual(child["promotion"], "Lightning Deal")
         self.assertEqual(child["promotion_discount_pct"], "23%")
 
-    def test_mapping_form_non_deal_promotion_preserves_display_without_deal_discount(self):
+    def test_mapping_form_non_deal_promotion_moves_to_coupon_without_deal_discount(self):
         child = monitor.normalize_child(
             "B0GJZYZHJJ",
             {"asin": "B0GJZYZHJJ", "promotions": [{"label": "Bundle deal 10% off"}]},
@@ -1596,7 +1657,8 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Bundle deal 10% off")
+        self.assertEqual(child["coupon"], "Bundle deal 10% off")
+        self.assertEqual(child["promotion"], "")
         self.assertIsNone(child["promotion_discount_pct"])
 
     def test_discount_text_without_percent_marker_is_not_treated_as_deal_discount(self):
@@ -1632,9 +1694,9 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(symbol["promotion"], "Lightning Deal; 20% off")
+        self.assertEqual(symbol["promotion"], "Lightning Deal")
         self.assertEqual(symbol["promotion_discount_pct"], "20%")
-        self.assertEqual(word["promotion"], "Lightning Deal; 20% off")
+        self.assertEqual(word["promotion"], "Lightning Deal")
         self.assertEqual(word["promotion_discount_pct"], "20%")
 
     def test_snake_case_deal_fields_are_normalized_with_discount_percentage(self):
@@ -1645,7 +1707,7 @@ class MonitorTest(unittest.TestCase):
             "pangolin",
         )
 
-        self.assertEqual(child["promotion"], "Lightning Deal; 23% off")
+        self.assertEqual(child["promotion"], "Lightning Deal")
         self.assertEqual(child["promotion_discount_pct"], "23%")
 
     def test_normalizes_pangolin_in_stock_as_inventory_when_xingshang_missing(self):
@@ -1703,6 +1765,38 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(captured["fragments"], ("get_store_asin_info",))
         self.assertEqual(captured["args"]["force_refresh"], False)
         self.assertNotIn("spu_item_id_list", captured["args"])
+
+    def test_previous_inventory_payload_scopes_to_requested_parent_membership(self):
+        previous = {
+            "parents": {
+                "PARENT1111": {
+                    "child_asins": ["CHILD11111"],
+                    "inventory_only_asins": ["CHILD11112"],
+                },
+                "PARENT2222": {
+                    "child_asins": ["CHILD22221"],
+                    "inventory_only_asins": ["CHILD22222"],
+                },
+            },
+            "children": {
+                "CHILD11111": {"inventory": 11},
+                "CHILD11112": {"inventory": 12},
+                "CHILD22221": {"inventory": 21},
+                "CHILD22222": {"inventory": 22},
+            },
+        }
+
+        payload = monitor.previous_inventory_payload(previous, "PARENT1111")
+
+        self.assertEqual(
+            payload,
+            {
+                "items": [
+                    {"asin": "CHILD11111", "inventory": 11},
+                    {"asin": "CHILD11112", "inventory": 12},
+                ]
+            },
+        )
 
     def test_collect_snapshot_separates_inventory_only_asins_from_live_children(self):
         seller_children = [
@@ -1763,7 +1857,7 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(parent["inventory_only_asins"], ["B0FVX6PTYC", "B0FVX93K44"])
         self.assertIn("B0FVX93K44", parent["front_unavailable_asins"])
         self.assertEqual(snapshot["children"]["B0FVX93K44"]["inventory"], 14)
-        self.assertEqual(snapshot["children"]["B0FVX93K44"]["front_status"], "不可售/404")
+        self.assertEqual(snapshot["children"]["B0FVX93K44"]["front_status"], "pangolin 前台侧未确认")
 
     def test_collect_snapshot_uses_sellersprite_parent_variations_when_pangolin_is_partial(self):
         seller_children = [
@@ -1843,7 +1937,7 @@ class MonitorTest(unittest.TestCase):
         parent = snapshot["parents"]["B0FFT1JQ9T"]
         self.assertEqual(parent["child_asins"], sorted(set(seller_children) - {"B0FFT2PHP9"} | {"B0FVX6PTYC"}))
         self.assertEqual(parent["inventory_only_asins"], ["B0FFT2PHP9", "B0FVX93K44"])
-        self.assertEqual(snapshot["children"]["B0FVX93K44"]["front_status"], "不可售/404")
+        self.assertEqual(snapshot["children"]["B0FVX93K44"]["front_status"], "pangolin 前台侧未确认")
 
     def test_collect_snapshot_uses_front_detail_validity_for_live_children(self):
         def fake_pangolin(token, parser_name, content, *, site, zipcode, timeout):
@@ -1887,8 +1981,8 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("B0FVX93K44", parent["front_unavailable_asins"])
         self.assertEqual(snapshot["children"]["B0FVX6PTYC"]["price"], 59.99)
         self.assertEqual(snapshot["children"]["B0FVX6PTYC"]["inventory"], 22)
-        self.assertEqual(snapshot["children"]["B0FFT2PHP9"]["front_status"], "不可售/404")
-        self.assertEqual(snapshot["children"]["B0FVX93K44"]["front_status"], "不可售/404")
+        self.assertEqual(snapshot["children"]["B0FFT2PHP9"]["front_status"], "pangolin 前台侧未确认")
+        self.assertEqual(snapshot["children"]["B0FVX93K44"]["front_status"], "pangolin 前台侧未确认")
 
     def test_collect_snapshot_does_not_use_fallback_to_prove_front_validity_after_pangolin_timeout(self):
         def fake_pangolin(token, parser_name, content, *, site, zipcode, timeout):
@@ -1924,7 +2018,201 @@ class MonitorTest(unittest.TestCase):
         parent = snapshot["parents"]["B0FFT1JQ9T"]
         self.assertEqual(parent["child_asins"], [])
         self.assertEqual(parent["inventory_only_asins"], ["B0FFT2PHP9"])
-        self.assertEqual(snapshot["children"]["B0FFT2PHP9"]["front_status"], "不可售/404")
+        self.assertEqual(snapshot["children"]["B0FFT2PHP9"]["front_status"], "pangolin 前台侧未确认")
+
+    def test_collect_snapshot_reuses_pangolin_child_detail_across_parents(self):
+        calls = []
+
+        def fake_pangolin(token, parser_name, content, *, site, zipcode, timeout):
+            calls.append(content)
+            if content in {"PARENT1111", "PARENT2222"}:
+                return {
+                    "data": {
+                        "json": {
+                            "data": {
+                                "results": [
+                                    {
+                                        "asin": content,
+                                        "ratings": 1,
+                                        "variationList": [{"asin": "CHILD11111"}],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            return {"data": {"json": {"data": {"results": [{"asin": content, "price": "$1.00", "fulfillment": "AMZ"}]}}}}
+
+        with (
+            patch("monitor.pangolin_scrape", side_effect=fake_pangolin),
+            patch("monitor.fetch_fallback_detail", return_value=({}, "")),
+            patch("monitor.fetch_inventory", return_value={"items": [{"asin": "CHILD11111", "inventory": 5}]}),
+        ):
+            snapshot = monitor.collect_snapshot(
+                {
+                    "PANGOLINFO_API_TOKEN": "token",
+                    "MONITOR_PARENT_ASINS": "PARENT1111,PARENT2222",
+                    "XINGSHANG_MCP_URL_TEMPLATE": "https://example.com/{parent_asin}",
+                    "MARKETPLACE": "US",
+                    "PANGOLIN_ZIPCODE": "10041",
+                    "PANGOLIN_TIMEOUT_SECONDS": "1",
+                    "MCP_TIMEOUT_SECONDS": "1",
+                }
+            )
+
+        self.assertEqual(calls.count("CHILD11111"), 1)
+        self.assertEqual(snapshot["source_metrics"]["pangolin"]["cache_hits"], 1)
+        self.assertEqual(snapshot["parents"]["PARENT1111"]["child_asins"], ["CHILD11111"])
+        self.assertEqual(snapshot["parents"]["PARENT2222"]["child_asins"], ["CHILD11111"])
+
+    def test_collect_snapshot_circuit_breaks_after_terminal_pangolin_error(self):
+        calls = []
+
+        def fake_pangolin(token, parser_name, content, *, site, zipcode, timeout):
+            calls.append(content)
+            return {"code": 2001, "message": "积分余额不足", "data": None}
+
+        with (
+            patch("monitor.pangolin_scrape", side_effect=fake_pangolin),
+            patch("monitor.fetch_fallback_detail", return_value=({}, "")),
+            patch("monitor.fetch_inventory", return_value={"items": [{"asin": "CHILD11111", "inventory": 5}]}),
+        ):
+            snapshot = monitor.collect_snapshot(
+                {
+                    "PANGOLINFO_API_TOKEN": "token",
+                    "MONITOR_PARENT_ASINS": "PARENT1111,PARENT2222",
+                    "XINGSHANG_MCP_URL_TEMPLATE": "https://example.com/{parent_asin}",
+                    "MARKETPLACE": "US",
+                    "PANGOLIN_ZIPCODE": "10041",
+                    "PANGOLIN_TIMEOUT_SECONDS": "1",
+                    "MCP_TIMEOUT_SECONDS": "1",
+                }
+            )
+
+        self.assertEqual(calls, ["PARENT1111"])
+        self.assertEqual(snapshot["source_metrics"]["pangolin"]["attempted"], 1)
+        self.assertGreaterEqual(snapshot["source_metrics"]["pangolin"]["circuit_skipped"], 1)
+        self.assertIn("积分余额不足", snapshot["source_metrics"]["pangolin"]["terminal_error"])
+        self.assertNotEqual(snapshot["children"]["CHILD11111"]["front_status"], "不可售/404")
+
+    def test_collect_snapshot_honors_pangolin_max_calls_per_run(self):
+        calls = []
+
+        def fake_pangolin(token, parser_name, content, *, site, zipcode, timeout):
+            calls.append(content)
+            if content == "PARENT1111":
+                return {
+                    "data": {
+                        "json": {
+                            "data": {
+                                "results": [
+                                    {
+                                        "asin": content,
+                                        "ratings": 1,
+                                        "variationList": [{"asin": "CHILD11111"}, {"asin": "CHILD22222"}],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            return {"data": {"json": {"data": {"results": [{"asin": content, "price": "$1.00", "fulfillment": "AMZ"}]}}}}
+
+        with (
+            patch("monitor.pangolin_scrape", side_effect=fake_pangolin),
+            patch("monitor.fetch_fallback_detail", return_value=({}, "")),
+            patch(
+                "monitor.fetch_inventory",
+                return_value={"items": [{"asin": "CHILD11111", "inventory": 5}, {"asin": "CHILD22222", "inventory": 6}]},
+            ),
+        ):
+            snapshot = monitor.collect_snapshot(
+                {
+                    "PANGOLINFO_API_TOKEN": "token",
+                    "MONITOR_PARENT_ASINS": "PARENT1111",
+                    "XINGSHANG_MCP_URL_TEMPLATE": "https://example.com/{parent_asin}",
+                    "MARKETPLACE": "US",
+                    "PANGOLIN_ZIPCODE": "10041",
+                    "PANGOLIN_TIMEOUT_SECONDS": "1",
+                    "PANGOLIN_MAX_CALLS_PER_RUN": "2",
+                    "MCP_TIMEOUT_SECONDS": "1",
+                }
+            )
+
+        self.assertEqual(calls, ["PARENT1111", "CHILD11111"])
+        self.assertEqual(snapshot["source_metrics"]["pangolin"]["max_call_skipped"], 1)
+        self.assertEqual(snapshot["children"]["CHILD22222"]["front_status"], "pangolin 前台侧未确认")
+
+    def test_diff_ignores_unconfirmed_xingshang_candidate_additions(self):
+        previous = {
+            "parents": {"PARENT1111": {"child_asins": [], "inventory_only_asins": []}},
+            "children": {},
+            "errors": [],
+        }
+        current = {
+            "parents": {"PARENT1111": {"child_asins": [], "inventory_only_asins": ["CHILD11111"]}},
+            "children": {
+                "CHILD11111": {
+                    "inventory": 5,
+                    "front_status": "pangolin 前台侧未确认",
+                    "source": "xingshang_candidate_unconfirmed",
+                }
+            },
+            "errors": [],
+        }
+
+        changes = monitor.diff_snapshots(previous, current)
+
+        self.assertNotIn("PARENT1111 inventory-only child added: CHILD11111", changes)
+
+    def test_snapshot_report_shows_candidate_counts_and_source_health(self):
+        snapshot = {
+            "captured_at": "2026-07-10T01:15:00Z",
+            "parents": {
+                "PARENT1111": {
+                    "child_asins": ["CHILD11111"],
+                    "inventory_only_asins": ["CHILD22222"],
+                    "source": "pangolin",
+                    "inventory_source": "xingshang",
+                },
+                "PARENT2222": {
+                    "child_asins": ["CHILD11111"],
+                    "inventory_only_asins": [],
+                    "source": "pangolin",
+                    "inventory_source": "xingshang",
+                },
+            },
+            "children": {
+                "CHILD11111": {"price": 1.0, "source": "pangolin"},
+                "CHILD22222": {
+                    "inventory": 6,
+                    "front_status": "pangolin 前台侧未确认",
+                    "source": "xingshang_candidate_unconfirmed",
+                },
+            },
+            "errors": [],
+            "source_metrics": {
+                "pangolin": {
+                    "planned": 4,
+                    "attempted": 3,
+                    "successful": 2,
+                    "failed": 1,
+                    "cache_hits": 1,
+                    "circuit_skipped": 1,
+                    "max_call_skipped": 0,
+                    "terminal_error": "pangolin response 2001: 积分余额不足",
+                },
+                "xingshang": {"attempted": 2, "successful": 2, "failed": 0, "previous_snapshot_fallback": 0},
+            },
+        }
+
+        message = monitor.format_snapshot_report_messages(snapshot)[0]
+
+        self.assertIn("唯一候选 ASIN：2", message)
+        self.assertIn("父子关系候选行：3", message)
+        self.assertIn("xingshang mcp 候选但 pangolin 前台侧未确认：1", message)
+        self.assertIn("数据源健康：Pangolinfo planned 4 / attempted 3 / success 2 / failed 1", message)
+        self.assertIn("circuit skipped 1", message)
 
     def test_collect_snapshot_defaults_pangolin_timeout_to_45(self):
         captured = []
@@ -2222,7 +2510,7 @@ class MonitorTest(unittest.TestCase):
 
         self.assertIn("状态：完整数据（SellerSprite 补源）", message)
         self.assertIn("子体：1", message)
-        self.assertIn("B0FFT34472｜价 85.53｜库存 295｜Coupon 无｜促销 7-Day Deal｜Deal折扣 未覆盖｜时效 未覆盖", message)
+        self.assertIn("B0FFT34472｜价 85.53｜库存 295｜Coupon 无｜Deal 7-Day Deal｜Deal折扣 未覆盖｜时效 未覆盖", message)
         self.assertNotIn("配送 AMZ", message)
         self.assertNotIn("退货", message)
         self.assertIn("库存侧异常：", message)

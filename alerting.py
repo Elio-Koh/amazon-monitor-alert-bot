@@ -377,7 +377,7 @@ def _classify_child_field(
         return _event("P2", "inventory", parent_asin, child_asin, field, before, after, f"{child_asin} 库存变化", detail, "确认库存变化是否符合预期", raw)
 
     if field in {"coupon", "promotion"}:
-        label = "Coupon" if field == "coupon" else "促销/Deal"
+        label = "Coupon" if field == "coupon" else "Deal"
         before_empty = _is_empty(before)
         after_empty = _is_empty(after)
         if before_empty and not after_empty:

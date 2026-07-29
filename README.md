@@ -9,7 +9,9 @@
 - 群消息不包含完整报告里的“监控范围”和明细大段文本。
 - 完整日报写入 `FULL_REPORT_OUTPUT`，父 ASIN 可筛选明细写入 `FULL_REPORT_XLSX_OUTPUT`，在 GitHub Actions 中一起上传为 `asin-full-daily-report` artifact。
 - Excel 第一张表 `父体筛选明细` 的 `父 ASIN` 列可直接筛选；筛选后会保留该父体行、正常子体行和库存侧异常子体行。
-- LD / BD 等 Deal 的具体折扣百分比会写入 `Deal 折扣百分比` 列，并在完整 txt 明细中显示为 `Deal折扣`。
+- Excel 促销信息拆成 `Coupon`、`Deal` 和 `Deal 折扣百分比`：前台可见的 Save/Coupon/brand promotion 类优惠写入 `Coupon`；只有 LTD / LD / BD / DOTD 等真实 Deal 写入 `Deal`，且 `Deal` 单元格保留具体 Deal 类型。
+- 列表价折扣、划线价百分比、Prime Member Price 只影响当前成交价，不归入 `Coupon` 或 `Deal`。
+- 真实 Deal 的具体折扣百分比会写入 `Deal 折扣百分比` 列，并在完整 txt 明细中显示为 `Deal折扣`。
 - 去重历史写在加密 state 的 `alert_dedupe` 字段里，避免窗口期内重复刷同一事件。
 
 ## 关键配置
